@@ -19,8 +19,7 @@ from src.ui.pages import render_data_generation_page, render_talk_to_data_page, 
 def configure_page():
     """Configure the Streamlit page."""
     st.set_page_config(
-        page_title="Data Generation Assistant",
-        page_icon="🤖",
+        page_title="Data Assistant",
         layout="wide",
         initial_sidebar_state="expanded"
     )

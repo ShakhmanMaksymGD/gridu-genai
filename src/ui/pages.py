@@ -71,7 +71,7 @@ def render_talk_to_data_page():
 def render_sidebar_navigation():
     """Render the sidebar navigation."""
     with st.sidebar:
-        st.markdown("<h3 style='margin-bottom: 2rem;'>Assistant</h3>", unsafe_allow_html=True)
+        st.markdown("<h3 style='margin-bottom: 2rem;'>Data Assistant</h3>", unsafe_allow_html=True)
         
         # Navigation with selectbox to maintain state
         selected_tab = st.selectbox(
