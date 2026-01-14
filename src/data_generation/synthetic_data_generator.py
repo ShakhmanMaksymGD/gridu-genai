@@ -17,6 +17,7 @@ from google.generativeai.types import FunctionDeclaration, Tool
 from pydantic import BaseModel, Field
 
 from ..utils.ddl_parser import Schema, Table, Column, ConstraintType
+from ..utils.langfuse_observer import data_observer, trace_llm_generation
 from config.settings import settings
 
 
@@ -88,6 +89,7 @@ class SyntheticDataGenerator:
             generation_config=generation_config
         )
     
+    @trace_llm_generation("gemini-2.0-flash-exp", "schema_data_generation")
     async def generate_schema_data(
         self, 
         schema: Schema, 
@@ -99,6 +101,14 @@ class SyntheticDataGenerator:
         
         if generation_params is None:
             generation_params = {}
+        
+        # Start Langfuse session tracking
+        schema_name = getattr(schema, 'name', 'unknown_schema')
+        data_observer.start_generation_session(
+            schema_name=schema_name,
+            num_tables=len(schema.tables),
+            rows_per_table=num_rows_per_table
+        )
         
         context = DataGenerationContext(
             schema=schema,
@@ -117,6 +127,8 @@ class SyntheticDataGenerator:
             print(f"Generating data for table: {table_name}")
             print(f"DEBUG: Using num_rows = {num_rows_per_table} for table {table_name}")
             
+            start_time = asyncio.get_event_loop().time()
+            
             try:
                 table_data = await self._generate_table_data(
                     table_name, 
@@ -124,14 +136,44 @@ class SyntheticDataGenerator:
                     num_rows_per_table
                 )
                 
+                end_time = asyncio.get_event_loop().time()
+                generation_time = end_time - start_time
+                
                 if table_data is not None:
                     context.generated_tables[table_name] = table_data
                     print(f"✅ Generated {len(table_data)} rows for {table_name}")
+                    
+                    # Log successful table generation
+                    data_observer.log_table_generation(
+                        table_name=table_name,
+                        num_rows=len(table_data),
+                        generation_time=generation_time,
+                        success=True
+                    )
                 else:
                     print(f"❌ Failed to generate data for {table_name} - returned None")
+                    data_observer.log_table_generation(
+                        table_name=table_name,
+                        num_rows=0,
+                        generation_time=generation_time,
+                        success=False
+                    )
             except Exception as e:
+                end_time = asyncio.get_event_loop().time()
+                generation_time = end_time - start_time
                 print(f"❌ Error generating data for {table_name}: {e}")
+                
+                # Log failed table generation
+                data_observer.log_table_generation(
+                    table_name=table_name,
+                    num_rows=0,
+                    generation_time=generation_time,
+                    success=False
+                )
                 continue  # Continue with next table instead of stopping
+        
+        # End the generation session
+        data_observer.end_generation_session()
         
         print(f"Completed generation for {len(context.generated_tables)} out of {len(creation_order)} tables")
         return context.generated_tables

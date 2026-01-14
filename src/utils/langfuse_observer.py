@@ -12,9 +12,16 @@ from datetime import datetime
 from functools import wraps
 import traceback
 
-from langfuse import Langfuse
-from langfuse.decorators import observe
-from langfuse.model import CreateTrace, CreateSpan, CreateGeneration
+try:
+    from langfuse import Langfuse
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    print("⚠️ Langfuse not installed - observability features disabled")
+    LANGFUSE_AVAILABLE = False
+    # Create dummy classes for when langfuse is not available
+    class Langfuse:
+        pass
+    
 import pandas as pd
 
 from config.settings import settings
@@ -30,6 +37,10 @@ class LangfuseObserver:
     
     def initialize_langfuse(self):
         """Initialize Langfuse client if credentials are provided."""
+        if not LANGFUSE_AVAILABLE:
+            print("⚠️ Langfuse not available - observability disabled")
+            return
+            
         try:
             if (settings.langfuse_secret_key and 
                 settings.langfuse_public_key and
@@ -51,7 +62,7 @@ class LangfuseObserver:
     
     def is_enabled(self) -> bool:
         """Check if Langfuse observability is enabled."""
-        return self.langfuse_client is not None
+        return LANGFUSE_AVAILABLE and self.langfuse_client is not None
     
     def create_trace(self, name: str, user_id: Optional[str] = None, metadata: Optional[Dict] = None) -> Optional[str]:
         """Create a new trace for a user session or operation."""
@@ -59,15 +70,13 @@ class LangfuseObserver:
             return None
         
         try:
-            trace_id = str(uuid.uuid4())
+            trace_id = self.langfuse_client.create_trace_id()
             
-            self.langfuse_client.trace(
-                id=trace_id,
+            # Log a simple event to start the trace
+            self.langfuse_client.create_event(
                 name=name,
-                user_id=user_id or "anonymous",
-                session_id=self.session_id,
-                metadata=metadata or {},
-                timestamp=datetime.utcnow()
+                input={"user_id": user_id or "anonymous", "metadata": metadata or {}},
+                metadata=metadata or {}
             )
             
             return trace_id
@@ -82,18 +91,14 @@ class LangfuseObserver:
             return None
         
         try:
-            span_id = str(uuid.uuid4())
-            
-            self.langfuse_client.span(
-                id=span_id,
-                trace_id=trace_id,
+            span = self.langfuse_client.start_span(
                 name=name,
                 input=self._serialize_input(input_data),
                 metadata=metadata or {},
-                start_time=datetime.utcnow()
+                trace_id=trace_id
             )
             
-            return span_id
+            return span.id if hasattr(span, 'id') else str(uuid.uuid4())
             
         except Exception as e:
             print(f"Failed to create span: {e}")
@@ -105,12 +110,10 @@ class LangfuseObserver:
             return
         
         try:
-            self.langfuse_client.span(
-                id=span_id,
+            self.langfuse_client.update_current_span(
                 output=self._serialize_output(output_data),
                 metadata=metadata or {},
-                end_time=datetime.utcnow(),
-                status_message=status
+                level="DEFAULT" if status == "success" else "ERROR"
             )
             
         except Exception as e:
@@ -127,24 +130,27 @@ class LangfuseObserver:
         metadata: Optional[Dict] = None
     ) -> Optional[str]:
         """Log an LLM generation event."""
-        if not self.is_enabled() or not trace_id:
+        if not self.is_enabled():
             return None
         
         try:
-            generation_id = str(uuid.uuid4())
-            
-            self.langfuse_client.generation(
-                id=generation_id,
-                trace_id=trace_id,
-                name=name,
-                model=model,
-                input=input_messages,
-                output=output_text,
-                usage=usage or {},
-                metadata=metadata or {},
-                start_time=datetime.utcnow(),
-                end_time=datetime.utcnow()
+            # Use create_event for simple generation logging
+            event = self.langfuse_client.create_event(
+                name=f"generation_{name}",
+                input={"messages": input_messages, "model": model},
+                output={"text": output_text, "usage": usage or {}},
+                metadata={
+                    "model": model,
+                    "usage": usage or {},
+                    **(metadata or {})
+                }
             )
+            
+            return event.id if hasattr(event, 'id') else str(uuid.uuid4())
+            
+        except Exception as e:
+            print(f"Failed to log generation: {e}")
+            return None
             
             return generation_id
             
@@ -495,22 +501,21 @@ data_observer = DataGenerationObserver()
 # Convenience functions
 def log_user_action(action: str, details: Dict[str, Any]):
     """Log a user action for analytics."""
-    trace_id = observer.create_trace(
-        name="user_action",
-        metadata={
-            "action": action,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    )
-    
-    observer.langfuse_client.event(
-        trace_id=trace_id,
-        name=action,
-        input=details,
-        metadata={
-            "category": "user_interaction"
-        }
-    ) if observer.is_enabled() else None
+    if not observer.is_enabled():
+        return
+        
+    try:
+        observer.langfuse_client.create_event(
+            name=f"user_action_{action}",
+            input=details,
+            metadata={
+                "action": action,
+                "category": "user_interaction",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+    except Exception as e:
+        print(f"Failed to log user action: {e}")
     
     observer.flush()
 

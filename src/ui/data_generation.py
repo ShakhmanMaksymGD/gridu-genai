@@ -7,6 +7,7 @@ import asyncio
 import streamlit as st
 from config.settings import settings
 from src.data_generation.synthetic_data_generator import DataGenerationContext
+from src.utils.langfuse_observer import log_user_action, data_observer
 
 
 class DataGenerationManager:
@@ -89,6 +90,16 @@ class DataGenerationManager:
         if st.session_state.schema is None:
             st.error("Please upload a DDL schema first")
             return
+        
+        # Log data generation request
+        log_user_action("data_generation_started", {
+            "num_rows": num_rows,
+            "temperature": temperature,
+            "user_instructions": user_instructions,
+            "max_tokens": max_tokens,
+            "num_tables": len(st.session_state.schema.tables),
+            "table_names": list(st.session_state.schema.tables.keys())
+        })
         
         try:
             with st.spinner("🔄 Generating synthetic data..."):
@@ -190,6 +201,13 @@ class DataGenerationManager:
             st.warning("Please provide modification instructions")
             return
         
+        # Log table modification request
+        log_user_action("table_modification_started", {
+            "table_name": table_name,
+            "instructions": modification_instructions,
+            "original_rows": len(st.session_state.generated_data.get(table_name, []))
+        })
+        
         try:
             with st.spinner(f"🔄 Modifying {table_name}..."):
                 current_data = st.session_state.generated_data[table_name]
@@ -208,6 +226,13 @@ class DataGenerationManager:
                     st.session_state.generated_data[table_name] = modified_data
                     st.success(f"✅ Modified {table_name}")
                     
+                    # Log successful modification
+                    data_observer.log_table_modification(
+                        table_name=table_name,
+                        instructions=modification_instructions,
+                        success=True
+                    )
+                    
                     # Update database
                     if st.session_state.db_handler:
                         DataGenerationManager._store_table_in_database(table_name, modified_data)
@@ -215,6 +240,13 @@ class DataGenerationManager:
                     st.rerun()
                 else:
                     st.error(f"❌ Failed to modify {table_name} - method returned None")
+                    
+                    # Log failed modification
+                    data_observer.log_table_modification(
+                        table_name=table_name,
+                        instructions=modification_instructions,
+                        success=False
+                    )
                     
         except Exception as e:
             st.error(f"❌ Error modifying data: {e}")
