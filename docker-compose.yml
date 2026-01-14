@@ -1,0 +1,92 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: synthetic_data_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-synthetic_data_app}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - synthetic_data_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-synthetic_data_app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Streamlit Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synthetic_data_app
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-synthetic_data_app}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - DEBUG=${DEBUG:-True}
+    volumes:
+      - ./data:/app/data
+      - ./temp_uploads:/app/temp_uploads
+      - ./logs:/app/logs
+    ports:
+      - "${APP_PORT:-8501}:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - synthetic_data_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # pgAdmin (optional - for database management)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: synthetic_data_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      - postgres
+    networks:
+      - synthetic_data_network
+    restart: unless-stopped
+    profiles:
+      - admin  # Only start with --profile admin
+
+volumes:
+  postgres_data:
+    driver: local
+    name: synthetic_data_postgres_data
+  pgadmin_data:
+    driver: local
+    name: synthetic_data_pgadmin_data
+
+networks:
+  synthetic_data_network:
+    driver: bridge
+    name: synthetic_data_network
