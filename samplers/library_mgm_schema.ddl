@@ -101,12 +101,11 @@ CREATE TABLE Employees (
     first_name VARCHAR(100) NOT NULL,
     last_name VARCHAR(100) NOT NULL,
     job_title VARCHAR(100),
-    department_id INT,  -- FK to Departments
+    department_id INT,  -- FK to Departments (added later)
     branch_id INT,      -- FK to Library_Branches
     email VARCHAR(255),
     phone_number VARCHAR(20),
     hire_date DATE,
-    FOREIGN KEY (department_id) REFERENCES Departments(department_id),
     FOREIGN KEY (branch_id) REFERENCES Library_Branches(branch_id)
 );
 
@@ -115,8 +114,14 @@ CREATE TABLE Departments (
     department_id INT PRIMARY KEY AUTO_INCREMENT,
     name VARCHAR(100),
     location VARCHAR(255),
-    manager_id INT, -- FK to Employees
-    FOREIGN KEY (manager_id) REFERENCES Employees(employee_id)
+    manager_id INT -- FK to Employees (added later)
 );
+
+-- Add the circular foreign key constraints after both tables exist
+ALTER TABLE Employees
+ADD CONSTRAINT FK_Employees_DepartmentID FOREIGN KEY (department_id) REFERENCES Departments(department_id);
+
+ALTER TABLE Departments  
+ADD CONSTRAINT FK_Departments_ManagerID FOREIGN KEY (manager_id) REFERENCES Employees(employee_id);
 ALTER TABLE Library_Branches
 ADD CONSTRAINT FK_Library_Branches_ManagerID FOREIGN KEY (manager_id) REFERENCES Employees(employee_id);

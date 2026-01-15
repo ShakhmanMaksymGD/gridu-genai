@@ -230,8 +230,14 @@ class DatabaseHandler:
         
         elif data_type == 'ENUM':
             if column.enum_values:
-                values = "', '".join(column.enum_values)
-                return f"VARCHAR(50) CHECK ({column.name} IN ('{values}'))"
+                # Properly escape single quotes in enum values
+                escaped_values = []
+                for value in column.enum_values:
+                    # Escape single quotes and wrap in quotes
+                    escaped_value = value.replace("'", "''")
+                    escaped_values.append(f"'{escaped_value}'")
+                values = ", ".join(escaped_values)
+                return f"VARCHAR(50) CHECK ({column.name} IN ({values}))"
             return "VARCHAR(50)"
         
         else:
@@ -263,7 +269,7 @@ class DatabaseHandler:
         """Insert DataFrame data into a table."""
         try:
             # Clean the DataFrame
-            df_clean = self._clean_dataframe_for_postgres(df)
+            df_clean = self._clean_dataframe_for_postgres(df, table_name)
             
             # Insert data
             df_clean.to_sql(
@@ -281,21 +287,36 @@ class DatabaseHandler:
             logger.error(f"Failed to insert data into {table_name}: {e}")
             return False
     
-    def _clean_dataframe_for_postgres(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _clean_dataframe_for_postgres(self, df: pd.DataFrame, table_name: str = None) -> pd.DataFrame:
         """Clean DataFrame for PostgreSQL insertion."""
         df_clean = df.copy()
         
-        # Replace NaN values with None
-        df_clean = df_clean.where(pd.notna(df_clean), None)
+        # Replace missing values based on type, but be careful not to violate NOT NULL constraints
+        for col in df_clean.columns:
+            if df_clean[col].isnull().any():
+                # For numeric columns: NaN -> 0 (only if safe to do so)
+                if df_clean[col].dtype in ['int64', 'float64', 'Int64']:
+                    # Only fill with 0 for nullable columns or when we know it's safe
+                    df_clean[col] = df_clean[col].fillna(0)
+                # For datetime columns: keep as null for now
+                elif df_clean[col].dtype in ['datetime64[ns]', '<M8[ns]']:
+                    # Don't auto-fill datetime nulls as they might violate NOT NULL constraints
+                    pass
+                # For all other columns (text, etc.): None -> empty string only if it's safe
+                else:
+                    # Only replace with empty string if the column allows it
+                    df_clean[col] = df_clean[col].fillna('')
         
         # Convert datetime columns to proper format
         for col in df_clean.columns:
             if df_clean[col].dtype == 'object':
                 # Try to convert to datetime if it looks like a date
                 try:
-                    pd.to_datetime(df_clean[col], errors='raise')
-                    df_clean[col] = pd.to_datetime(df_clean[col])
+                    # Test if it's already a datetime-like column
+                    test_conversion = pd.to_datetime(df_clean[col], errors='raise')
+                    df_clean[col] = test_conversion
                 except:
+                    # Not a datetime column, skip conversion
                     pass
         
         return df_clean

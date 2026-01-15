@@ -64,7 +64,7 @@ class DataGenerationManager:
     def _render_table_data(selected_table: str):
         """Render individual table data."""
         df = st.session_state.generated_data[selected_table]
-        st.dataframe(df, use_container_width=True, height=300)
+        st.dataframe(df, width="stretch", height=300)
     
     @staticmethod
     def _render_quick_edit_section(selected_table: str):
@@ -73,14 +73,14 @@ class DataGenerationManager:
         
         with edit_col1:
             quick_edit = st.text_input(
-                "",
+                "Quick edit instructions",
                 placeholder="Edit quick edit instructions...",
                 key="quick_edit_input",
                 label_visibility="collapsed"
             )
         
         with edit_col2:
-            if st.button("Submit", key="quick_edit_generate", use_container_width=True):
+            if st.button("Submit", key="quick_edit_generate", width="stretch"):
                 if quick_edit.strip():
                     DataGenerationManager.modify_table_data(selected_table, quick_edit)
     
@@ -123,7 +123,7 @@ class DataGenerationManager:
                     st.session_state.raw_ai_responses = raw_responses
                     st.success(f"✅ Generated data for {len(generated_data)} tables")
                     
-                    # Store in database
+                    # Store in database - ensure all tables are saved
                     if st.session_state.db_handler:
                         DataGenerationManager._store_in_database()
                     
@@ -280,25 +280,33 @@ class DataGenerationManager:
                 # Create database if not exists
                 st.session_state.db_handler.create_database_if_not_exists()
                 
-                # Create tables
-                success = st.session_state.db_handler.create_schema_tables(st.session_state.schema)
-                
-                if success:
-                    # Insert data
-                    success = st.session_state.db_handler.bulk_insert_data(
-                        st.session_state.generated_data, 
-                        st.session_state.schema
-                    )
+                # Try to create tables - if it fails due to schema issues, we'll still show the data
+                try:
+                    success = st.session_state.db_handler.create_schema_tables(st.session_state.schema)
                     
                     if success:
-                        st.success("✅ Data stored in database")
+                        # Insert data using bulk insert method
+                        success = st.session_state.db_handler.bulk_insert_data(
+                            st.session_state.generated_data, 
+                            st.session_state.schema
+                        )
+                        
+                        if success:
+                            total_rows = sum(len(data) for data in st.session_state.generated_data.values())
+                            st.success(f"✅ All {len(st.session_state.generated_data)} tables saved to database ({total_rows} total rows)")
+                        else:
+                            st.warning(f"⚠️ Generated data successfully but failed to store in database. Data is still available in the UI.")
                     else:
-                        st.error("❌ Failed to store data in database")
-                else:
-                    st.error("❌ Failed to create database tables")
+                        st.warning("⚠️ Failed to create database tables due to schema issues. Generated data is available in the UI but not saved to database.")
+                        
+                except Exception as schema_error:
+                    # Schema has issues (like missing primary keys), but we still have the generated data
+                    st.warning(f"⚠️ Database schema issue: {str(schema_error)[:100]}... Generated data is available in the UI.")
+                    print(f"Schema error: {schema_error}")
                     
         except Exception as e:
-            st.error(f"❌ Database storage error: {e}")
+            st.warning(f"⚠️ Database storage error: {str(e)[:100]}... Generated data is still available in the UI.")
+            print(f"Database storage error: {e}")
     
     @staticmethod
     def _store_table_in_database(table_name: str, data):

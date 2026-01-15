@@ -26,6 +26,8 @@ class SessionManager:
             st.session_state.db_handler = None
         if 'data_generator' not in st.session_state:
             st.session_state.data_generator = None
+        if 'chat_interface' not in st.session_state:
+            st.session_state.chat_interface = None
     
     @staticmethod
     def initialize_components() -> bool:
@@ -35,7 +37,9 @@ class SessionManager:
                 st.session_state.db_handler = DatabaseHandler()
                 
             if st.session_state.data_generator is None:
-                st.session_state.data_generator = SyntheticDataGenerator()
+                # Pass the database engine to enable foreign key validation
+                db_engine = st.session_state.db_handler.engine if st.session_state.db_handler else None
+                st.session_state.data_generator = SyntheticDataGenerator(db_engine=db_engine)
                 
             return True
         except Exception as e:

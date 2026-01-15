@@ -3,12 +3,23 @@ DDL Schema Parser Module
 
 This module provides functionality to parse DDL (Data Definition Language) files
 and extract table structures, columns, data types, constraints, and relationships.
+
+Uses SQLGlot-based parser for reliable DDL parsing.
 """
 import re
-import sqlparse
+import sqlglot
+from sqlglot import exp, parse_one
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+
+
+class ConstraintType(Enum):
+    """Constraint types."""
+    PRIMARY_KEY = "PRIMARY_KEY"
+    FOREIGN_KEY = "FOREIGN_KEY" 
+    UNIQUE = "UNIQUE"
+    CHECK = "CHECK"
 
 
 class DataType(Enum):
@@ -22,16 +33,6 @@ class DataType(Enum):
     BOOLEAN = "BOOLEAN"
     ENUM = "ENUM"
     TIMESTAMP = "TIMESTAMP"
-
-
-class ConstraintType(Enum):
-    """Constraint types."""
-    PRIMARY_KEY = "PRIMARY_KEY"
-    FOREIGN_KEY = "FOREIGN_KEY"
-    UNIQUE = "UNIQUE"
-    NOT_NULL = "NOT_NULL"
-    CHECK = "CHECK"
-    DEFAULT = "DEFAULT"
 
 
 @dataclass
@@ -95,355 +96,334 @@ class Table:
         return f"Table(name='{self.name}', columns={len(self.columns)}, constraints={len(self.constraints)})"
 
 
-@dataclass
+@dataclass  
 class Schema:
     """Represents a database schema."""
+    name: str = "default"
     tables: Dict[str, Table] = field(default_factory=dict)
     
     def add_table(self, table: Table):
         """Add a table to the schema."""
         self.tables[table.name] = table
     
-    def get_table_dependencies(self) -> List[Tuple[str, str]]:
-        """Get table dependencies based on foreign keys."""
-        dependencies = []
-        for table in self.tables.values():
-            for fk in table.get_foreign_keys():
-                if fk.referenced_table and fk.referenced_table != table.name:
-                    dependencies.append((fk.referenced_table, table.name))
-        return dependencies
+    def get_table_names(self) -> List[str]:
+        """Get all table names."""
+        return list(self.tables.keys())
     
     def get_creation_order(self) -> List[str]:
-        """Get tables in creation order (respecting foreign key dependencies)."""
-        dependencies = self.get_table_dependencies()
-        table_names = list(self.tables.keys())
+        """Get tables in dependency order for creation."""
+        # Simple topological sort based on foreign key dependencies
+        remaining = set(self.tables.keys())
         ordered = []
         
-        # Simple topological sort
-        while table_names:
+        while remaining:
             # Find tables with no unresolved dependencies
             ready = []
-            for table in table_names:
-                has_unresolved_deps = any(
-                    dep[0] in table_names for dep in dependencies 
-                    if dep[1] == table
-                )
-                if not has_unresolved_deps:
-                    ready.append(table)
+            for table_name in remaining:
+                table = self.tables[table_name]
+                dependencies = set()
+                
+                for constraint in table.constraints:
+                    if (constraint.constraint_type == ConstraintType.FOREIGN_KEY and 
+                        constraint.referenced_table):
+                        dependencies.add(constraint.referenced_table)
+                
+                # Check if all dependencies are already ordered
+                if dependencies.issubset(set(ordered)):
+                    ready.append(table_name)
             
             if not ready:
-                # Handle circular dependencies by adding remaining tables
-                ready = table_names[:]
+                # Handle circular dependencies by just taking any remaining table
+                ready = [next(iter(remaining))]
             
             ordered.extend(ready)
-            for table in ready:
-                table_names.remove(table)
+            remaining -= set(ready)
         
         return ordered
+    
+    def __str__(self):
+        return f"Schema(name='{self.name}', tables={len(self.tables)})"
 
 
-class DDLParser:
-    """Parser for DDL statements."""
+def parse_ddl_content(ddl_content: str) -> Schema:
+    """Parse DDL content using SQLGlot transpilation and simple extraction."""
+    schema = Schema()
     
-    def __init__(self):
-        self.schema = Schema()
+    try:
+        # First transpile from MySQL to PostgreSQL for normalization
+        transpiled_statements = sqlglot.transpile(ddl_content, read="mysql", write="postgres")
+        full_sql = "\\n".join(transpiled_statements)
+    except Exception as e:
+        print(f"Warning: SQLGlot transpilation failed: {e}")
+        full_sql = ddl_content
+
+    # Extract CREATE TABLE statements using a simpler approach
+    # Split on CREATE TABLE and process each section
+    create_sections = re.split(r'CREATE\s+TABLE', full_sql, flags=re.IGNORECASE)
     
-    def parse_ddl(self, ddl_content: str) -> Schema:
-        """Parse DDL content and return a Schema object."""
-        self.schema = Schema()
-        
-        # Parse SQL statements using sqlparse
-        statements = sqlparse.split(ddl_content)
-        
-        for statement in statements:
-            if statement.strip():
-                self._parse_statement(statement.strip())
-        
-        return self.schema
-    
-    def _parse_statement(self, statement: str):
-        """Parse a single DDL statement."""
-        parsed = sqlparse.parse(statement)[0]
-        
-        # Check if it's a CREATE TABLE statement
-        if self._is_create_table_statement(parsed):
-            self._parse_create_table(statement)
-    
-    def _is_create_table_statement(self, parsed) -> bool:
-        """Check if the parsed statement is a CREATE TABLE statement."""
-        tokens = list(parsed.flatten())
-        create_found = False
-        table_found = False
-        
-        for token in tokens:
-            if token.ttype is sqlparse.tokens.Keyword or token.ttype is sqlparse.tokens.Keyword.DDL:
-                if token.value.upper() == 'CREATE':
-                    create_found = True
-                elif token.value.upper() == 'TABLE' and create_found:
-                    table_found = True
-                    break
-        
-        return create_found and table_found
-    
-    def _parse_create_table(self, statement: str):
-        """Parse a CREATE TABLE statement."""
-        # Extract table name
-        table_name_match = re.search(r'CREATE\s+TABLE\s+(\w+)', statement, re.IGNORECASE)
-        if not table_name_match:
-            return
-        
-        table_name = table_name_match.group(1)
-        table = Table(name=table_name)
-        
-        # Extract column definitions and constraints
-        # Find the content within parentheses
-        paren_match = re.search(r'\((.*)\)', statement, re.DOTALL)
-        if not paren_match:
-            return
-        
-        content = paren_match.group(1)
-        
-        # Split by commas, but be careful of commas within function calls
-        items = self._split_table_definition(content)
-        
-        for item in items:
-            item = item.strip()
-            if self._is_constraint_definition(item):
-                constraint = self._parse_constraint(item)
-                if constraint:
-                    table.add_constraint(constraint)
-            else:
-                column = self._parse_column_definition(item)
-                if column:
-                    table.add_column(column)
-                    # Check for inline constraints
-                    inline_constraints = self._parse_inline_constraints(item, column.name)
-                    for constraint in inline_constraints:
-                        table.add_constraint(constraint)
-        
-        self.schema.add_table(table)
-    
-    def _split_table_definition(self, content: str) -> List[str]:
-        """Split table definition by commas, respecting parentheses."""
-        items = []
-        current_item = ""
-        paren_level = 0
-        
-        for char in content:
-            if char == '(':
-                paren_level += 1
-            elif char == ')':
-                paren_level -= 1
-            elif char == ',' and paren_level == 0:
-                items.append(current_item.strip())
-                current_item = ""
-                continue
+    for i, section in enumerate(create_sections[1:], 1):  # Skip first empty section
+        # Extract table name and definition with better parentheses handling
+        # Look for table_name followed by opening paren, then find the matching closing paren
+        name_match = re.match(r'\s+(\w+)\s*\(', section)
+        if name_match:
+            table_name = name_match.group(1)
             
-            current_item += char
+            # Find the table definition by counting parentheses
+            start_pos = name_match.end() - 1  # Position of opening paren
+            paren_count = 0
+            end_pos = start_pos
+            
+            for j, char in enumerate(section[start_pos:], start_pos):
+                if char == '(':
+                    paren_count += 1
+                elif char == ')':
+                    paren_count -= 1
+                    if paren_count == 0:
+                        end_pos = j
+                        break
+            
+            # Extract the content between the parentheses
+            table_def = section[start_pos + 1:end_pos]
+            
+            table = Table(name=table_name)
+            
+            # Parse columns and constraints from the table definition
+            try:
+                _parse_table_definition(table, table_def)
+                schema.add_table(table)
+            except Exception as e:
+                # Continue with next table instead of stopping
+                continue
+    
+    return schema
+
+
+def _parse_table_definition(table: Table, table_def: str):
+    """Parse table definition content."""
+    # Split by commas but respect parentheses
+    items = _split_by_commas(table_def)
+    
+    for item in items:
+        item = item.strip()
         
-        if current_item.strip():
+        # Check if it's a constraint or column
+        if _is_constraint(item):
+            _parse_constraint(table, item)
+        else:
+            _parse_column(table, item)
+
+
+def _split_by_commas(content: str) -> List[str]:
+    """Split content by commas, respecting parentheses."""
+    items = []
+    current_item = ""
+    paren_depth = 0
+    
+    for char in content:
+        if char == '(':
+            paren_depth += 1
+        elif char == ')':
+            paren_depth -= 1
+        elif char == ',' and paren_depth == 0:
             items.append(current_item.strip())
+            current_item = ""
+            continue
         
-        return items
+        current_item += char
     
-    def _is_constraint_definition(self, item: str) -> bool:
-        """Check if an item is a constraint definition."""
-        constraint_keywords = ['PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE', 'CHECK', 'CONSTRAINT']
-        item_upper = item.upper()
-        return any(keyword in item_upper for keyword in constraint_keywords)
+    if current_item.strip():
+        items.append(current_item.strip())
     
-    def _parse_column_definition(self, definition: str) -> Optional[Column]:
-        """Parse a column definition."""
-        # Match column name and data type
-        match = re.match(r'(\w+)\s+(\w+(?:\([^)]+\))?)', definition, re.IGNORECASE)
-        if not match:
-            return None
+    return items
+
+
+def _is_constraint(item: str) -> bool:
+    """Check if an item is a constraint definition."""
+    item_upper = item.upper().strip()
+    
+    # Check if it starts with constraint keywords (standalone constraints)
+    constraint_starts = [
+        'PRIMARY KEY',
+        'FOREIGN KEY', 
+        'UNIQUE',
+        'CHECK',
+        'CONSTRAINT'
+    ]
+    
+    for keyword in constraint_starts:
+        if item_upper.startswith(keyword):
+            return True
+            
+    # For PRIMARY KEY, also check if it's a multi-column constraint like "PRIMARY KEY (col1, col2)"
+    if 'PRIMARY KEY' in item_upper and '(' in item_upper:
+        # Find PRIMARY KEY followed by parentheses
+        if re.search(r'PRIMARY\s+KEY\s*\(', item_upper):
+            return True
+    
+    return False
+
+
+def _parse_column(table: Table, column_def: str):
+    """Parse a column definition."""
+    # Remove comments
+    column_def = re.sub(r'--.*$', '', column_def).strip()
+    
+    # Extract column name and data type
+    parts = column_def.split()
+    if len(parts) < 2:
+        return
         
-        column_name = match.group(1)
-        data_type_full = match.group(2)
-        
-        # Extract data type and parameters
-        data_type, max_length, precision, scale, enum_values = self._parse_data_type(data_type_full)
-        
-        # Ensure data_type is a string
-        if not isinstance(data_type, str):
-            data_type = str(data_type) if data_type else "TEXT"
-        
-        column = Column(
-            name=column_name,
-            data_type=data_type,
-            max_length=max_length,
-            precision=precision,
-            scale=scale,
-            enum_values=enum_values
+    column_name = parts[0]
+    data_type_part = parts[1]
+    
+    # Parse data type 
+    data_type, max_length, precision, scale = _parse_data_type(data_type_part)
+    
+    # Create column
+    column = Column(
+        name=column_name,
+        data_type=data_type,
+        max_length=max_length,
+        precision=precision,
+        scale=scale
+    )
+    
+    # Check for column constraints
+    column_def_upper = column_def.upper()
+    
+    if 'NOT NULL' in column_def_upper:
+        column.is_nullable = False
+    
+    if any(keyword in column_def_upper for keyword in ['AUTO_INCREMENT', 'GENERATED BY DEFAULT AS IDENTITY']):
+        column.auto_increment = True
+        column.is_nullable = False
+    
+    if 'PRIMARY KEY' in column_def_upper:
+        column.is_nullable = False
+        # Add primary key constraint
+        pk_constraint = Constraint(
+            name=None,
+            constraint_type=ConstraintType.PRIMARY_KEY,
+            columns=[column_name]
         )
-        
-        # Check for column attributes
-        definition_upper = definition.upper()
-        
-        if 'NOT NULL' in definition_upper:
-            column.is_nullable = False
-        
-        if 'AUTO_INCREMENT' in definition_upper:
-            column.auto_increment = True
-        
-        # Check for default value
-        default_match = re.search(r'DEFAULT\s+([^,\s]+)', definition, re.IGNORECASE)
-        if default_match:
-            column.default_value = default_match.group(1)
-        
-        return column
+        table.add_constraint(pk_constraint)
     
-    def _parse_data_type(self, data_type_str: str) -> Tuple[str, Optional[int], Optional[int], Optional[int], List[str]]:
-        """Parse data type string and extract type, length, precision, scale."""
-        # Handle ENUM separately
-        if data_type_str.upper().startswith('ENUM'):
-            enum_match = re.match(r'ENUM\s*\(([^)]+)\)', data_type_str, re.IGNORECASE)
-            if enum_match:
-                enum_values = [val.strip().strip("'\"") for val in enum_match.group(1).split(',')]
-                return 'ENUM', None, None, None, enum_values
-        
-        # Handle other data types with parameters
-        type_match = re.match(r'(\w+)(?:\(([^)]+)\))?', data_type_str)
-        if not type_match:
-            return data_type_str, None, None, None, []
-        
-        base_type = type_match.group(1).upper()
-        params = type_match.group(2)
-        
-        max_length = None
-        precision = None
-        scale = None
-        
-        if params:
-            if ',' in params:
-                # DECIMAL(10,2) format
-                parts = [p.strip() for p in params.split(',')]
-                if len(parts) >= 2:
-                    precision = int(parts[0]) if parts[0].isdigit() else None
-                    scale = int(parts[1]) if parts[1].isdigit() else None
-            else:
-                # VARCHAR(255) format
-                if params.isdigit():
-                    max_length = int(params)
-        
-        return base_type, max_length, precision, scale, []
+    table.add_column(column)
+
+
+def _parse_data_type(data_type_str: str) -> Tuple[str, Optional[int], Optional[int], Optional[int]]:
+    """Parse data type string."""
+    # Handle common type mappings
+    type_mapping = {
+        'SERIAL': 'INT',
+        'INTEGER': 'INT',
+        'BIGINT': 'INT', 
+        'NUMERIC': 'DECIMAL',
+        'FLOAT': 'DECIMAL',
+        'DOUBLE': 'DECIMAL',
+        'CHAR': 'VARCHAR',
+        'CHARACTER': 'VARCHAR',
+        'BOOL': 'BOOLEAN'
+    }
     
-    def _parse_inline_constraints(self, definition: str, column_name: str) -> List[Constraint]:
-        """Parse inline constraints from column definition."""
-        constraints = []
-        definition_upper = definition.upper()
-        
-        if 'PRIMARY KEY' in definition_upper:
-            constraints.append(Constraint(
-                name=None,
-                constraint_type=ConstraintType.PRIMARY_KEY,
-                columns=[column_name]
-            ))
-        
-        if 'UNIQUE' in definition_upper:
-            constraints.append(Constraint(
-                name=None,
-                constraint_type=ConstraintType.UNIQUE,
-                columns=[column_name]
-            ))
-        
-        # Handle REFERENCES (foreign key)
-        fk_match = re.search(r'REFERENCES\s+(\w+)\s*\((\w+)\)', definition, re.IGNORECASE)
-        if fk_match:
-            ref_table = fk_match.group(1)
-            ref_column = fk_match.group(2)
-            constraints.append(Constraint(
-                name=None,
-                constraint_type=ConstraintType.FOREIGN_KEY,
-                columns=[column_name],
-                referenced_table=ref_table,
-                referenced_columns=[ref_column]
-            ))
-        
-        return constraints
+    # Extract base type and parameters
+    match = re.match(r'(\\w+)(?:\\(([^)]+)\\))?', data_type_str)
+    if not match:
+        return "TEXT", None, None, None
     
-    def _parse_constraint(self, definition: str) -> Optional[Constraint]:
-        """Parse a standalone constraint definition."""
-        definition = definition.strip()
-        definition_upper = definition.upper()
-        
-        # Primary Key
-        pk_match = re.search(r'PRIMARY\s+KEY\s*\(([^)]+)\)', definition, re.IGNORECASE)
-        if pk_match:
-            columns = [col.strip() for col in pk_match.group(1).split(',')]
-            return Constraint(
+    base_type = match.group(1).upper()
+    params_str = match.group(2)
+    
+    # Map type
+    mapped_type = type_mapping.get(base_type, base_type)
+    
+    # Parse parameters
+    max_length = None
+    precision = None
+    scale = None
+    
+    if params_str:
+        params = [p.strip() for p in params_str.split(',')]
+        if mapped_type in ['VARCHAR', 'CHAR']:
+            try:
+                max_length = int(params[0])
+            except (ValueError, IndexError):
+                pass
+        elif mapped_type == 'DECIMAL':
+            try:
+                precision = int(params[0])
+                if len(params) > 1:
+                    scale = int(params[1])
+            except (ValueError, IndexError):
+                pass
+    
+    return mapped_type, max_length, precision, scale
+
+
+def _parse_constraint(table: Table, constraint_def: str):
+    """Parse a constraint definition."""
+    constraint_def_upper = constraint_def.upper()
+    
+    # Primary key constraint
+    if 'PRIMARY KEY' in constraint_def_upper:
+        # Extract column names
+        match = re.search(r'PRIMARY\\s+KEY\\s*\\(([^)]+)\\)', constraint_def, re.IGNORECASE)
+        if match:
+            columns = [col.strip() for col in match.group(1).split(',')]
+            constraint = Constraint(
                 name=None,
                 constraint_type=ConstraintType.PRIMARY_KEY,
                 columns=columns
             )
-        
-        # Foreign Key
-        fk_match = re.search(r'FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+(\w+)\s*\(([^)]+)\)', definition, re.IGNORECASE)
-        if fk_match:
-            columns = [col.strip() for col in fk_match.group(1).split(',')]
-            ref_table = fk_match.group(2)
-            ref_columns = [col.strip() for col in fk_match.group(3).split(',')]
-            return Constraint(
+            table.add_constraint(constraint)
+    
+    # Foreign key constraint
+    elif 'FOREIGN KEY' in constraint_def_upper:
+        # Extract local columns, referenced table and columns
+        fk_pattern = r'FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+(\w+)\s*\(([^)]+)\)'
+        match = re.search(fk_pattern, constraint_def, re.IGNORECASE)
+        if match:
+            local_columns = [col.strip() for col in match.group(1).split(',')]
+            ref_table = match.group(2)
+            ref_columns = [col.strip() for col in match.group(3).split(',')]
+            
+            constraint = Constraint(
                 name=None,
                 constraint_type=ConstraintType.FOREIGN_KEY,
-                columns=columns,
+                columns=local_columns,
                 referenced_table=ref_table,
                 referenced_columns=ref_columns
             )
-        
-        # Unique
-        unique_match = re.search(r'UNIQUE\s*\(([^)]+)\)', definition, re.IGNORECASE)
-        if unique_match:
-            columns = [col.strip() for col in unique_match.group(1).split(',')]
-            return Constraint(
+            table.add_constraint(constraint)
+    
+    # Unique constraint
+    elif constraint_def_upper.startswith('UNIQUE'):
+        match = re.search(r'UNIQUE\\s*\\(([^)]+)\\)', constraint_def, re.IGNORECASE)
+        if match:
+            columns = [col.strip() for col in match.group(1).split(',')]
+            constraint = Constraint(
                 name=None,
                 constraint_type=ConstraintType.UNIQUE,
                 columns=columns
             )
-        
-        return None
+            table.add_constraint(constraint)
 
 
 def parse_ddl_file(file_path: str) -> Schema:
-    """Parse a DDL file and return a Schema object."""
-    parser = DDLParser()
-    
-    with open(file_path, 'r', encoding='utf-8') as file:
-        ddl_content = file.read()
-    
-    return parser.parse_ddl(ddl_content)
+    """Parse DDL file and return schema."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        ddl_content = f.read()
+    return parse_ddl_content(ddl_content)
 
 
-def parse_ddl_content(content: str) -> Schema:
-    """Parse DDL content and return a Schema object."""
-    parser = DDLParser()
-    return parser.parse_ddl(content)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Test with the company schema
-    test_ddl = """
-    CREATE TABLE Companies (
-        company_id INT PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(255) NOT NULL,
-        industry VARCHAR(100)
-    );
-
-    CREATE TABLE Departments (
-        department_id INT PRIMARY KEY AUTO_INCREMENT,
-        company_id INT NOT NULL,
-        name VARCHAR(100) NOT NULL,
-        FOREIGN KEY (company_id) REFERENCES Companies(company_id)
-    );
-    """
-    
-    schema = parse_ddl_content(test_ddl)
-    print(f"Parsed {len(schema.tables)} tables:")
-    for table_name, table in schema.tables.items():
-        print(f"  {table}")
-        for col_name, col in table.columns.items():
-            print(f"    {col}")
-        for constraint in table.constraints:
-            print(f"    {constraint}")
+# Re-export everything for backward compatibility
+__all__ = [
+    'parse_ddl_content',
+    'parse_ddl_file',
+    'Schema', 
+    'Table',
+    'Column', 
+    'Constraint',
+    'ConstraintType',
+    'DataType'
+]

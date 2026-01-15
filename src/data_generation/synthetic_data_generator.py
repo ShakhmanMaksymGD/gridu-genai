@@ -11,14 +11,20 @@ import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import sqlalchemy as sa
+from sqlalchemy import text
+import logging
 
 import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
 from pydantic import BaseModel, Field
 
 from ..utils.ddl_parser import Schema, Table, Column, ConstraintType
-from ..utils.langfuse_observer import data_observer, trace_llm_generation
 from config.settings import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class TableDataRequest(BaseModel):
@@ -44,9 +50,10 @@ class DataGenerationContext:
     generated_tables: Dict[str, pd.DataFrame]
     user_instructions: str
     generation_params: Dict[str, Any]
+    db_engine: Optional[Any] = None  # Database engine for foreign key validation
     
     def get_referenced_data(self, table_name: str) -> Dict[str, List[Any]]:
-        """Get data from referenced tables for foreign key constraints."""
+        """Get data from referenced tables for foreign key constraints by querying actual database."""
         table = self.schema.tables[table_name]
         referenced_data = {}
         
@@ -55,11 +62,37 @@ class DataGenerationContext:
                 ref_table = constraint.referenced_table
                 ref_columns = constraint.referenced_columns
                 
-                if ref_table in self.generated_tables:
-                    ref_df = self.generated_tables[ref_table]
-                    for ref_col in ref_columns:
-                        if ref_col in ref_df.columns:
-                            referenced_data[f"{ref_table}.{ref_col}"] = ref_df[ref_col].tolist()
+                # Try to get actual values from database first
+                if self.db_engine is not None:
+                    try:
+                        for ref_col in ref_columns:
+                            query = text(f"SELECT DISTINCT {ref_col} FROM {ref_table} WHERE {ref_col} IS NOT NULL ORDER BY {ref_col}")
+                            
+                            with self.db_engine.connect() as conn:
+                                result = conn.execute(query)
+                                values = [row[0] for row in result.fetchall()]
+                                
+                            if values:
+                                referenced_data[f"{ref_table}.{ref_col}"] = values
+                                print(f"✅ Found {len(values)} valid {ref_col} values in {ref_table}: {values[:10]}...")
+                            else:
+                                print(f"⚠️ No values found in {ref_table}.{ref_col}, will use generated data")
+                                
+                    except Exception as e:
+                        print(f"⚠️ Could not query {ref_table}.{ref_col} from database: {e}")
+                        # Fall back to generated data if database query fails
+                        if ref_table in self.generated_tables:
+                            ref_df = self.generated_tables[ref_table]
+                            for ref_col in ref_columns:
+                                if ref_col in ref_df.columns:
+                                    referenced_data[f"{ref_table}.{ref_col}"] = ref_df[ref_col].tolist()
+                else:
+                    # Fall back to generated data if no database connection
+                    if ref_table in self.generated_tables:
+                        ref_df = self.generated_tables[ref_table]
+                        for ref_col in ref_columns:
+                            if ref_col in ref_df.columns:
+                                referenced_data[f"{ref_table}.{ref_col}"] = ref_df[ref_col].tolist()
         
         return referenced_data
 
@@ -67,8 +100,9 @@ class DataGenerationContext:
 class SyntheticDataGenerator:
     """Main synthetic data generator using Gemini 2.0 Flash."""
     
-    def __init__(self):
+    def __init__(self, db_engine=None):
         self.model = None
+        self.db_engine = db_engine
         self.initialize_gemini()
         
     def initialize_gemini(self):
@@ -89,7 +123,6 @@ class SyntheticDataGenerator:
             generation_config=generation_config
         )
     
-    @trace_llm_generation("gemini-2.0-flash-exp", "schema_data_generation")
     async def generate_schema_data(
         self, 
         schema: Schema, 
@@ -102,19 +135,16 @@ class SyntheticDataGenerator:
         if generation_params is None:
             generation_params = {}
         
-        # Start Langfuse session tracking
+        # Start data generation
         schema_name = getattr(schema, 'name', 'unknown_schema')
-        data_observer.start_generation_session(
-            schema_name=schema_name,
-            num_tables=len(schema.tables),
-            rows_per_table=num_rows_per_table
-        )
+        print(f"Starting data generation for schema: {schema_name}")
         
         context = DataGenerationContext(
             schema=schema,
             generated_tables={},
             user_instructions=user_instructions,
-            generation_params=generation_params
+            generation_params=generation_params,
+            db_engine=self.db_engine
         )
         
         # Get tables in dependency order
@@ -142,38 +172,15 @@ class SyntheticDataGenerator:
                 if table_data is not None:
                     context.generated_tables[table_name] = table_data
                     print(f"✅ Generated {len(table_data)} rows for {table_name}")
-                    
-                    # Log successful table generation
-                    data_observer.log_table_generation(
-                        table_name=table_name,
-                        num_rows=len(table_data),
-                        generation_time=generation_time,
-                        success=True
-                    )
+                    logger.info(f"Table {table_name}: Generated {len(table_data)} rows with columns {list(table_data.columns)}")
                 else:
                     print(f"❌ Failed to generate data for {table_name} - returned None")
-                    data_observer.log_table_generation(
-                        table_name=table_name,
-                        num_rows=0,
-                        generation_time=generation_time,
-                        success=False
-                    )
+                    logger.warning(f"Table {table_name}: Generation failed - returned None")
             except Exception as e:
                 end_time = asyncio.get_event_loop().time()
                 generation_time = end_time - start_time
                 print(f"❌ Error generating data for {table_name}: {e}")
-                
-                # Log failed table generation
-                data_observer.log_table_generation(
-                    table_name=table_name,
-                    num_rows=0,
-                    generation_time=generation_time,
-                    success=False
-                )
                 continue  # Continue with next table instead of stopping
-        
-        # End the generation session
-        data_observer.end_generation_session()
         
         print(f"Completed generation for {len(context.generated_tables)} out of {len(creation_order)} tables")
         return context.generated_tables
@@ -211,6 +218,7 @@ class SyntheticDataGenerator:
                 
                 print(f"DEBUG: AI Response for {table_name} (length: {len(response_text)} chars):")
                 print(response_text[:500] + "..." if len(response_text) > 500 else response_text)
+                logger.info(f"AI response for {table_name}: {len(response_text)} chars, first 200: {response_text[:200]}")
                 
                 # Try to extract CSV from the response
                 df = self._parse_csv_from_response(response_text, table)
@@ -291,6 +299,9 @@ class SyntheticDataGenerator:
             "foreign_keys": []
         }
         
+        # Get context-specific guidance
+        context_guidance = self._get_table_context_guidance(table.name, table_info, referenced_data)
+        
         # Add column information
         for col_name, column in table.columns.items():
             col_info = {
@@ -329,13 +340,42 @@ class SyntheticDataGenerator:
         - Generate EXACTLY {num_rows} rows of data (no more, no less)
         - The CSV must have {num_rows} data rows plus 1 header row (total {num_rows + 1} lines)
         - **EVERY FIELD IN EVERY ROW MUST BE COMPLETELY FILLED - NO EMPTY OR INCOMPLETE FIELDS**
+        - **NEVER USE NULL, EMPTY, OR MISSING VALUES - Every field must contain valid data**
+        - **DO NOT GENERATE**: null, NULL, None, empty strings "", blank spaces, or incomplete rows
+        - **MANDATORY**: All cells must contain realistic, valid data appropriate for the column type
         - Ensure data types match the column specifications
         - Respect all constraints (primary keys, foreign keys, nullability, etc.)
         - Make the data realistic and coherent
-        - For foreign keys, use values from the referenced data provided below
+        
+        🔗 **FOREIGN KEY RELATIONSHIPS & RELATIVE KEYS GENERATION:**
+        - **MANDATORY**: For foreign key columns, you MUST ONLY use values from the referenced data provided below
+        - **DISTRIBUTION**: Distribute foreign key values realistically - don't use the same reference ID repeatedly
+        - **RELATIONSHIPS**: Create meaningful relationships between tables:
+          * If generating employee data, spread employees across different departments/companies
+          * If generating project assignments, relate employees to projects they would realistically work on
+          * If generating transaction data, relate it to existing customers/accounts
+        - **COHERENT MAPPINGS**: Ensure foreign key selections make logical sense:
+          * Senior employees should be in leadership departments
+          * Project assignments should match employee skills/departments
+          * Geographic data should be consistent (same city employees work on local projects)
+        - **BALANCED DISTRIBUTION**: Use a good mix of available foreign key values, not just the first few
+        - **REALISTIC PATTERNS**: Mirror real-world patterns (80/20 rule, normal distributions, etc.)
         
         Referenced Data (for foreign key constraints):
         {json.dumps(referenced_data, indent=2) if referenced_data else "None"}
+        
+        ⚠️ FOREIGN KEY VALIDATION RULES:
+        {self._build_foreign_key_rules(table_info['foreign_keys'], referenced_data)}
+        
+        🎯 **TABLE-SPECIFIC RELATIONSHIP GUIDANCE:**
+        {context_guidance}
+        
+        📊 **DATA COHERENCE GUIDELINES:**
+        - Create realistic correlations between related fields
+        - Use appropriate date ranges (hire_dates before project start dates, etc.)
+        - Generate amounts/quantities that make business sense
+        - Ensure enum values are contextually appropriate
+        - Maintain consistency within each record (matching location data, appropriate salaries for roles, etc.)
         
         User Instructions:
         {user_instructions if user_instructions else "Generate realistic, diverse data appropriate for the table context."}
@@ -344,6 +384,8 @@ class SyntheticDataGenerator:
         - Provide EXACTLY {num_rows} rows of data in CSV format
         - Include a header row with column names
         - **COMPLETE ALL FIELDS - Do not leave any field empty or partial (e.g., avoid "3,1,Tester," - complete it as "3,1,Tester,40.5,2023-01-15,2023-03-30")**
+        - **NO NULL VALUES**: Do not use null, NULL, None, empty strings, or any missing values
+        - **EVERY CELL MUST HAVE DATA**: Each field must contain a realistic value appropriate for its data type
         - **COUNT YOUR FIELDS: Each data row must have EXACTLY {len(table_info['columns'])} values (one per column)**
         - Wrap the CSV data in ```csv and ``` markdown code blocks
         - Do NOT use quotes around field values unless absolutely necessary
@@ -367,6 +409,19 @@ class SyntheticDataGenerator:
         3,1,Tester,
         ```
         
+        ❌ FORBIDDEN VALUES - DO NOT USE:
+        - null, NULL, None
+        - Empty strings: ""
+        - Incomplete rows: "1,2,Developer,"
+        - Missing values or gaps
+        - Blank cells or spaces only
+        
+        ✅ REQUIRED: Every cell must contain valid data like:
+        - Numbers: 123, 45.67, 0
+        - Strings: "Software Engineer", "Active", "New York"
+        - Dates: 2023-01-15, 2024-12-31
+        - IDs: 1, 2, 3 (from valid foreign key values)
+        
         VALIDATION CHECKLIST:
         ✓ {num_rows} data rows generated
         ✓ Header row included  
@@ -389,6 +444,89 @@ class SyntheticDataGenerator:
         """
         
         return prompt
+    
+    def _build_foreign_key_rules(self, foreign_keys: List[Dict], referenced_data: Dict[str, List[Any]]) -> str:
+        """Build explicit foreign key validation rules for the AI prompt."""
+        if not foreign_keys:
+            return "No foreign key constraints."
+            
+        rules = []
+        for fk in foreign_keys:
+            local_cols = fk['columns']
+            ref_table = fk['referenced_table']
+            ref_cols = fk['referenced_columns']
+            
+            for i, local_col in enumerate(local_cols):
+                ref_col = ref_cols[i] if i < len(ref_cols) else ref_cols[0]
+                key = f"{ref_table}.{ref_col}"
+                
+                if key in referenced_data:
+                    valid_values = referenced_data[key]
+                    sample_values = valid_values[:10] if len(valid_values) > 10 else valid_values
+                    
+                    rules.append(f"""
+📌 Column '{local_col}' → References {ref_table}.{ref_col}
+   ✅ VALID VALUES: {sample_values}{'...' if len(valid_values) > 10 else ''}
+   📊 Total available: {len(valid_values)} values
+   🎯 INSTRUCTION: Distribute these values realistically across your {num_rows if 'num_rows' in locals() else 'generated'} rows
+   💡 TIP: Use different values, don't repeat the same ID multiple times unless realistic""")
+                else:
+                    rules.append(f"⚠️ Column '{local_col}' references {ref_table}.{ref_col} but no valid values found!")
+                    
+        return "\n".join(rules) if rules else "No specific foreign key rules."
+    
+    def _get_table_context_guidance(self, table_name: str, table_info: Dict, referenced_data: Dict[str, List[Any]]) -> str:
+        """Provide specific guidance based on the table type and its relationships."""
+        name_lower = table_name.lower()
+        guidance = []
+        
+        # Employee-related tables
+        if 'employee' in name_lower:
+            if 'department' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("🏢 Distribute employees across different departments realistically")
+                guidance.append("💼 Match job titles/roles with appropriate departments (IT employees in IT dept, etc.)")
+            if 'salary' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("💰 Generate salaries that correlate with job levels and experience")
+            if 'hire_date' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("📅 Use realistic hire dates (not all employees hired on same day)")
+                
+        # Project-related tables
+        elif 'project' in name_lower:
+            if 'company' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("🏭 Distribute projects across companies realistically")
+                guidance.append("📈 Larger companies should have more/bigger projects")
+            if 'budget' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("💸 Project budgets should vary realistically (10K to 1M+)")
+                
+        # Assignment/junction tables
+        elif any(word in name_lower for word in ['assignment', 'junction', '_projects', '_benefits']):
+            guidance.append("🔗 Create realistic many-to-many relationships")
+            guidance.append("⚖️ Don't assign every employee to every project - be selective")
+            guidance.append("🎲 Use natural distribution patterns (some employees on multiple projects, others on one)")
+            
+        # Department tables
+        elif 'department' in name_lower:
+            guidance.append("🏢 Create diverse, realistic department types (IT, HR, Sales, Marketing, etc.)")
+            if 'manager' in [col['name'].lower() for col in table_info.get('columns', [])]:
+                guidance.append("👔 Each department should have different managers")
+                
+        # Review/performance tables
+        elif any(word in name_lower for word in ['review', 'performance', 'evaluation']):
+            guidance.append("📊 Distribute ratings realistically (not all excellent or poor)")
+            guidance.append("📝 Match review dates with employment periods")
+            guidance.append("🎯 Align performance ratings with employee roles and experience")
+            
+        # Benefits tables
+        elif 'benefit' in name_lower:
+            guidance.append("💊 Different employees get different benefit types")
+            guidance.append("📋 Coverage amounts should vary by benefit type and employee level")
+            
+        # Generic guidance for any table with foreign keys
+        if table_info.get('foreign_keys'):
+            guidance.append("🔗 CRITICAL: Use diverse foreign key values - avoid repeating the same IDs")
+            guidance.append("🎯 Create realistic distributions across referenced entities")
+        
+        return "\n".join([f"   {g}" for g in guidance]) if guidance else "   Generate realistic, contextually appropriate relationships."
     
     async def _call_gemini_with_retry(self, prompt: str, generation_params: Optional[Dict[str, Any]] = None, max_retries: int = 3):
         """Call Gemini API with retry logic and optional generation parameters."""
@@ -510,6 +648,7 @@ class SyntheticDataGenerator:
                 return None
                 
             print(f"Successfully parsed CSV with {len(df)} rows and columns: {list(df.columns)}")
+            logger.info(f"CSV parsing success: {len(df)} rows, columns: {list(df.columns)}")
             return df
             
         except Exception as e:
@@ -549,10 +688,24 @@ class SyntheticDataGenerator:
                             valid_values = ref_df[ref_col].dropna().unique().tolist()
                             if valid_values:
                                 # Ensure all foreign key values are valid
-                                df.loc[df[local_col].notna(), local_col] = [
-                                    random.choice(valid_values) 
-                                    for _ in range(sum(df[local_col].notna()))
-                                ]
+                                # First, handle rows with non-null values
+                                non_null_mask = df[local_col].notna()
+                                if non_null_mask.sum() > 0:
+                                    df.loc[non_null_mask, local_col] = [
+                                        random.choice(valid_values) 
+                                        for _ in range(non_null_mask.sum())
+                                    ]
+                                
+                                # For nullable foreign keys, leave nulls as they are
+                                # For non-nullable foreign keys, assign valid values
+                                table_column = table.columns.get(local_col)
+                                if table_column and not table_column.is_nullable:
+                                    null_mask = df[local_col].isnull()
+                                    if null_mask.sum() > 0:
+                                        df.loc[null_mask, local_col] = [
+                                            random.choice(valid_values) 
+                                            for _ in range(null_mask.sum())
+                                        ]
         
         # Ensure unique constraints
         for constraint in table.constraints:
@@ -567,6 +720,21 @@ class SyntheticDataGenerator:
             if col_name in df.columns:
                 df[col_name] = self._convert_column_type(df[col_name], column)
         
+        # Validate NOT NULL constraints
+        for col_name, column in table.columns.items():
+            if col_name in df.columns and not column.is_nullable:
+                null_count = df[col_name].isnull().sum()
+                if null_count > 0:
+                    # Fill null values with appropriate defaults for NOT NULL columns
+                    if 'date' in str(column.data_type).lower():
+                        df[col_name] = df[col_name].fillna(pd.Timestamp.now())
+                    elif str(column.data_type).upper() in ['INT', 'INTEGER', 'BIGINT']:
+                        df[col_name] = df[col_name].fillna(1)
+                    elif str(column.data_type).upper() in ['DECIMAL', 'FLOAT', 'DOUBLE']:
+                        df[col_name] = df[col_name].fillna(0.0)
+                    else:
+                        df[col_name] = df[col_name].fillna('DefaultValue')
+        
         return df
     
     def _convert_column_type(self, series: pd.Series, column: Column) -> pd.Series:
@@ -579,21 +747,45 @@ class SyntheticDataGenerator:
             data_type = str(column.data_type)
             
         if data_type in ['INT', 'INTEGER', 'BIGINT']:
-            return pd.to_numeric(series, errors='coerce').fillna(0).astype(int)
+            # Only fill with 0 if column is nullable, otherwise preserve nulls for later validation
+            numeric_series = pd.to_numeric(series, errors='coerce')
+            if column.is_nullable:
+                return numeric_series.fillna(0).astype(int)
+            else:
+                return numeric_series.astype('Int64')  # Nullable integer type
         
         elif data_type in ['DECIMAL', 'FLOAT', 'DOUBLE']:
-            return pd.to_numeric(series, errors='coerce')
+            numeric_series = pd.to_numeric(series, errors='coerce')
+            if column.is_nullable:
+                return numeric_series
+            else:
+                return numeric_series.fillna(0.0)
         
         elif data_type in ['DATE']:
-            return pd.to_datetime(series, errors='coerce').dt.date
+            date_series = pd.to_datetime(series, errors='coerce').dt.date
+            if not column.is_nullable:
+                # Replace NaT with today's date for non-nullable fields
+                date_series = date_series.fillna(pd.Timestamp.now().date())
+            return date_series
         
         elif data_type in ['DATETIME', 'TIMESTAMP']:
-            return pd.to_datetime(series, errors='coerce')
+            datetime_series = pd.to_datetime(series, errors='coerce')
+            if not column.is_nullable:
+                # Replace NaT with current timestamp for non-nullable fields
+                datetime_series = datetime_series.fillna(pd.Timestamp.now())
+            return datetime_series
         
         elif data_type in ['VARCHAR', 'TEXT', 'CHAR']:
+            string_series = series.astype(str)
             if column.max_length:
-                return series.astype(str).str[:column.max_length]
-            return series.astype(str)
+                string_series = string_series.str[:column.max_length]
+            if not column.is_nullable:
+                # Replace 'nan' strings (from NaN values) with '0'
+                string_series = string_series.replace('nan', '0')
+                # For empty strings, we can leave them as is (empty string is valid for VARCHAR)
+                # Or replace with a default value if needed
+                # string_series = string_series.replace('', 'N/A')  # uncomment if needed
+            return string_series
         
         elif data_type == 'ENUM':
             # Ensure values are from the allowed enum values

@@ -67,22 +67,36 @@ class LangfuseObserver:
     def create_trace(self, name: str, user_id: Optional[str] = None, metadata: Optional[Dict] = None) -> Optional[str]:
         """Create a new trace for a user session or operation."""
         if not self.is_enabled():
+            print(f"🔍 Langfuse not enabled, skipping trace creation for {name}")
             return None
         
         try:
-            trace_id = self.langfuse_client.create_trace_id()
+            print(f"🔍 Creating Langfuse trace: {name}")
             
-            # Log a simple event to start the trace
+            # Generate a trace ID
+            trace_id = str(uuid.uuid4())
+            
+            # Create an initial event (without trace_id parameter)
             self.langfuse_client.create_event(
-                name=name,
-                input={"user_id": user_id or "anonymous", "metadata": metadata or {}},
-                metadata=metadata or {}
+                name=f"start_{name}",
+                input={
+                    "user_id": user_id or "anonymous", 
+                    "session_id": self.session_id,
+                    "operation": name,
+                    "trace_id": trace_id  # Include in metadata instead
+                },
+                metadata={
+                    "trace_id": trace_id,
+                    **(metadata or {})
+                }
             )
             
+            print(f"✅ Successfully created trace: {name} with ID: {trace_id}")
             return trace_id
             
         except Exception as e:
-            print(f"Failed to create trace: {e}")
+            print(f"❌ Failed to create trace: {e}")
+            traceback.print_exc()
             return None
     
     def create_span(self, trace_id: str, name: str, input_data: Any = None, metadata: Optional[Dict] = None) -> Optional[str]:
@@ -131,31 +145,47 @@ class LangfuseObserver:
     ) -> Optional[str]:
         """Log an LLM generation event."""
         if not self.is_enabled():
+            print(f"🔍 Langfuse not enabled, skipping generation logging for {name}")
             return None
         
         try:
-            # Use create_event for simple generation logging
-            event = self.langfuse_client.create_event(
-                name=f"generation_{name}",
-                input={"messages": input_messages, "model": model},
-                output={"text": output_text, "usage": usage or {}},
+            print(f"🔍 Logging generation to Langfuse: {name}")
+            print(f"🔍 Trace ID: {trace_id}, Model: {model}")
+            print(f"🔍 Input messages: {len(input_messages)} messages")
+            print(f"🔍 Output text length: {len(output_text) if output_text else 0}")
+            
+            # Create a generation event using start_generation
+            generation_id = str(uuid.uuid4())
+            
+            generation = self.langfuse_client.start_generation(
+                name=name,
+                model=model,
+                input=input_messages,
                 metadata={
                     "model": model,
                     "usage": usage or {},
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "trace_id": trace_id,  # Include in metadata for tracking
+                    "generation_id": generation_id,
                     **(metadata or {})
                 }
             )
             
-            return event.id if hasattr(event, 'id') else str(uuid.uuid4())
+            # Update the generation with output and usage
+            generation.update(
+                output=output_text,
+                usage=usage or {}
+            )
             
-        except Exception as e:
-            print(f"Failed to log generation: {e}")
-            return None
+            # End the generation
+            generation.end()
             
+            print(f"✅ Successfully logged generation: {name} with ID: {generation_id}")
             return generation_id
             
         except Exception as e:
-            print(f"Failed to log generation: {e}")
+            print(f"❌ Failed to log generation to Langfuse: {e}")
+            traceback.print_exc()
             return None
     
     def log_error(self, trace_id: str, error: Exception, context: Optional[Dict] = None):
@@ -164,8 +194,9 @@ class LangfuseObserver:
             return
         
         try:
-            self.langfuse_client.event(
-                trace_id=trace_id,
+            print(f"🔍 Logging error to Langfuse: {type(error).__name__}")
+            
+            self.langfuse_client.create_event(
                 name="error",
                 input=context or {},
                 output={
@@ -175,12 +206,16 @@ class LangfuseObserver:
                 },
                 metadata={
                     "severity": "error",
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "trace_id": trace_id  # Include in metadata for tracking
                 }
             )
             
+            print(f"✅ Successfully logged error: {type(error).__name__}")
+            
         except Exception as e:
-            print(f"Failed to log error: {e}")
+            print(f"❌ Failed to log error: {e}")
+            traceback.print_exc()
     
     def log_performance_metrics(self, trace_id: str, metrics: Dict[str, Any]):
         """Log performance metrics."""
@@ -228,9 +263,12 @@ class LangfuseObserver:
         """Flush any pending events to Langfuse."""
         if self.is_enabled():
             try:
+                print("🔍 Flushing Langfuse events...")
                 self.langfuse_client.flush()
+                print("✅ Successfully flushed Langfuse events")
             except Exception as e:
-                print(f"Failed to flush Langfuse events: {e}")
+                print(f"❌ Failed to flush Langfuse events: {e}")
+                traceback.print_exc()
 
 
 # Global observer instance
