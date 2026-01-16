@@ -817,8 +817,13 @@ class SyntheticDataGenerator:
         - Columns: {list(table.columns.keys())}
         - Constraints: {[str(c) for c in table.constraints]}
         
-        Modification Instructions:
+        Modification Instructions (APPLY ONLY TO THIS TABLE - {table_name}):
         {modification_instructions}
+        
+        IMPORTANT: 
+        - Only modify data in the {table_name} table
+        - Do not reference or change data in other tables
+        - Focus specifically on {table_name} columns: {list(table.columns.keys())}
         
         Please generate the modified data while maintaining:
         - All existing constraints

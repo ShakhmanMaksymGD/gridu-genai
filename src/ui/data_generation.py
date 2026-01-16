@@ -139,11 +139,16 @@ class DataGenerationManager:
             if generated_data:
                 st.session_state.generated_data = generated_data
                 st.session_state.raw_ai_responses = raw_responses
-                st.success(f"✅ Generated data for {len(generated_data)} tables")
                 
-                # Store in database - ensure all tables are saved
+                # Store in database first, then update UI based on success
+                database_saved = False
                 if st.session_state.db_handler:
-                    DataGenerationManager._store_in_database()
+                    database_saved = DataGenerationManager._store_in_database_with_verification()
+                
+                if database_saved:
+                    st.success(f"✅ Generated and saved {len(generated_data)} tables to database")
+                else:
+                    st.warning(f"⚠️ Generated {len(generated_data)} tables (UI only - database save failed)")
                 
                 st.rerun()
             else:
@@ -233,21 +238,41 @@ class DataGenerationManager:
             )
             
             if modified_data is not None:
-                # Update session state first
-                st.session_state.generated_data[table_name] = modified_data
-                st.success(f"✅ Modified {table_name}")
-                
-                # Update database gracefully
+                # Update database first to ensure consistency
+                database_updated = False
                 if st.session_state.db_handler:
                     try:
-                        DataGenerationManager._update_table_in_database_gracefully(table_name, modified_data)
-                    except Exception as db_error:
-                        error_msg = str(db_error).lower()
-                        if "foreign key" in error_msg or "violates" in error_msg:
-                            st.info(f"ℹ️ {table_name} successfully modified in UI. Database not updated due to foreign key relationships.")
+                        print(f"🔄 Starting database update for {table_name}")
+                        database_updated = DataGenerationManager._update_table_in_database_safely(table_name, modified_data)
+                        print(f"📊 Database update result for {table_name}: {database_updated}")
+                        
+                        if database_updated:
+                            # Verify the update by re-fetching from database
+                            try:
+                                print(f"🔍 Re-fetching data from database for {table_name}")
+                                fresh_data = st.session_state.db_handler.get_table_data(table_name)
+                                st.session_state.generated_data[table_name] = fresh_data
+                                st.success(f"✅ Modified {table_name} successfully and synced with database")
+                                print(f"✅ Successfully synced {table_name} with database")
+                            except Exception as fetch_error:
+                                # Fallback if fetch fails
+                                print(f"⚠️ Failed to re-fetch {table_name} from database: {fetch_error}")
+                                st.session_state.generated_data[table_name] = modified_data
+                                st.success(f"✅ Modified {table_name} (using cached data)")
                         else:
-                            st.warning(f"⚠️ Table modified in UI but database update failed: {str(db_error)[:100]}...")
-                        print(f"Database update error: {db_error}")
+                            st.warning(f"⚠️ {table_name} modified in UI only - database sync failed")
+                            st.session_state.generated_data[table_name] = modified_data
+                            print(f"❌ Database update failed for {table_name}")
+                    except Exception as db_error:
+                        st.error(f"❌ Database update failed: {str(db_error)[:100]}...")
+                        st.session_state.generated_data[table_name] = modified_data
+                        print(f"❌ Database update exception for {table_name}: {db_error}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # No database handler, just update UI
+                    st.session_state.generated_data[table_name] = modified_data
+                    st.info("ℹ️ Table modified in UI only (no database connection)")
                 
                 # Don't call st.rerun() here - let the quick edit section handle state transitions
             else:
@@ -290,127 +315,222 @@ class DataGenerationManager:
             loop.close()
     
     @staticmethod
-    def _update_table_in_database_gracefully(table_name: str, data):
-        """Gracefully update table data in database with better error handling."""
+    def _update_table_in_database_safely(table_name: str, data) -> bool:
+        """Safely update table data in database with comprehensive error handling."""
         try:
-            print(f"Updating table {table_name} in database...")
+            print(f"🔄 Updating table {table_name} in database...")
             
             # Check if database connection is available
             if not st.session_state.db_handler:
-                raise Exception("Database handler not available")
+                print("❌ Database handler not available")
+                return False
             
-            # Instead of deleting, let's try to update existing records
-            # This approach preserves foreign key relationships
+            # Validate data
+            if data is None or data.empty:
+                print("❌ No data to update")
+                return False
+            
+            print(f"📊 Data to update: {len(data)} rows with columns: {list(data.columns)}")
+            
+            # Strategy 1: Try clearing and inserting (most reliable for independent tables)
             try:
-                # Use UPSERT approach - PostgreSQL specific
-                success = st.session_state.db_handler.upsert_dataframe(table_name, data)
+                print(f"🗑️ Clearing existing data from {table_name}")
+                clear_success = st.session_state.db_handler.clear_table(table_name)
                 
-                if not success:
-                    # Fallback: try individual updates
-                    success = DataGenerationManager._update_records_individually(table_name, data)
-                
-                if success:
-                    print(f"✅ Successfully updated {table_name} in database ({len(data)} rows)")
+                if clear_success:
+                    print(f"✅ Successfully cleared {table_name}")
+                    print(f"📥 Inserting {len(data)} rows into {table_name}")
+                    
+                    insert_success = st.session_state.db_handler.insert_dataframe(table_name, data)
+                    
+                    if insert_success:
+                        print(f"✅ Successfully inserted data into {table_name}")
+                        
+                        # Verify the data was saved correctly
+                        saved_count = DataGenerationManager._verify_table_saved(table_name, len(data))
+                        
+                        if saved_count == len(data):
+                            print(f"✅ Verification successful: {table_name} has {saved_count} rows")
+                            return True
+                        else:
+                            print(f"❌ Verification failed: expected {len(data)}, got {saved_count}")
+                            return False
+                    else:
+                        print(f"❌ Failed to insert data into {table_name}")
+                        return False
                 else:
-                    raise Exception("Failed to update table data")
+                    print(f"❌ Failed to clear {table_name}, trying individual updates")
+                    return DataGenerationManager._update_records_with_individual_updates(table_name, data)
+                    
+            except Exception as e:
+                error_msg = str(e).lower()
+                print(f"❌ Clear+Insert strategy failed for {table_name}: {e}")
                 
-            except Exception as db_error:
-                error_msg = str(db_error).lower()
-                if "foreign key" in error_msg or "violates" in error_msg:
-                    print(f"⚠️ Foreign key constraint prevents updating {table_name} in database")
-                    st.warning(f"⚠️ {table_name} updated in UI only. Cannot update database due to foreign key relationships.")
-                else:
-                    raise db_error
+                # Strategy 2: Try individual row updates if clear+insert fails
+                print(f"🔄 Switching to individual row updates for {table_name}")
+                return DataGenerationManager._update_records_with_individual_updates(table_name, data)
                 
         except Exception as e:
-            print(f"❌ Database update error for {table_name}: {e}")
-            raise e
+            print(f"❌ Critical database update error for {table_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     @staticmethod
-    def _update_records_individually(table_name: str, data):
-        """Update records one by one using UPDATE statements."""
+    def _update_records_with_individual_updates(table_name: str, data) -> bool:
+        """Update table using individual UPDATE statements to preserve foreign key relationships."""
         try:
-            print(f"Attempting individual record updates for {table_name}")
+            print(f"🔄 Attempting individual row updates for {table_name}")
             
-            # Get the first column as the key (usually ID)
             if data.empty:
                 return True
                 
             columns = data.columns.tolist()
             key_column = columns[0]  # Assume first column is primary key
             
-            with st.session_state.db_handler.get_connection() as conn:
+            updated_count = 0
+            
+            # Use autocommit mode to avoid transaction issues
+            connection = st.session_state.db_handler.engine.connect()
+            
+            try:
                 for _, row in data.iterrows():
-                    # Build UPDATE statement
-                    key_value = row[key_column]
-                    
-                    # Build SET clause for other columns
-                    set_clauses = []
-                    for col in columns[1:]:  # Skip the key column
-                        set_clauses.append(f"{col} = :{col}")
-                    
-                    if set_clauses:  # Only if there are columns to update
-                        update_sql = f"""
-                        UPDATE {table_name} 
-                        SET {', '.join(set_clauses)}
-                        WHERE {key_column} = :{key_column}
-                        """
+                    try:
+                        # Build UPDATE statement for non-key columns
+                        key_value = str(row[key_column])  # Convert to string for TEXT fields
                         
-                        # Convert row to dict and ensure proper types
-                        params = {}
-                        for col in columns:
+                        set_clauses = []
+                        params = {'key_value': key_value}
+                        
+                        for col in columns[1:]:  # Skip the key column
                             value = row[col]
                             # Convert pandas/numpy types to native Python types
                             if hasattr(value, 'item'):
                                 value = value.item()
-                            params[col] = value
+                            
+                            # Convert to string for TEXT fields (all columns in our schema are TEXT)
+                            value = str(value) if value is not None else None
+                            
+                            set_clauses.append(f"{col} = :param_{col}")
+                            params[f'param_{col}'] = value
                         
-                        from sqlalchemy import text
-                        conn.execute(text(update_sql), params)
+                        if set_clauses:  # Only if there are columns to update
+                            update_sql = f"""
+                            UPDATE {table_name} 
+                            SET {', '.join(set_clauses)}
+                            WHERE {key_column} = :key_value
+                            """
+                            
+                            from sqlalchemy import text
+                            
+                            # Use a separate transaction for each update to avoid transaction aborts
+                            with connection.begin() as trans:
+                                result = connection.execute(text(update_sql), params)
+                                updated_count += result.rowcount
+                                trans.commit()
+                                
+                            print(f"✅ Updated row {key_value}")
+                        
+                    except Exception as row_error:
+                        print(f"❌ Failed to update row {row[key_column]}: {row_error}")
+                        # Continue with other rows instead of stopping
+                        continue
                 
-                conn.commit()
-                print(f"✅ Updated {len(data)} records in {table_name}")
-                return True
+                print(f"✅ Updated {updated_count} out of {len(data)} records in {table_name}")
+                
+                # Return True if we updated at least some records
+                return updated_count > 0
+                
+            finally:
+                connection.close()
                 
         except Exception as e:
             print(f"❌ Individual update failed for {table_name}: {e}")
             return False
     
     @staticmethod
-    def _store_in_database():
-        """Store generated data in PostgreSQL database."""
+    def _store_in_database_with_verification() -> bool:
+        """Store generated data in PostgreSQL database with verification."""
         try:
             with st.spinner("💾 Storing data in database..."):
                 # Create database if not exists
                 st.session_state.db_handler.create_database_if_not_exists()
                 
-                # Try to create tables - if it fails due to schema issues, we'll still show the data
+                # Track success for all operations
+                schema_created = False
+                tables_saved = {}
+                
+                # Try to create tables
                 try:
-                    success = st.session_state.db_handler.create_schema_tables(st.session_state.schema)
-                    
-                    if success:
-                        # Insert data using bulk insert method
-                        success = st.session_state.db_handler.bulk_insert_data(
-                            st.session_state.generated_data, 
-                            st.session_state.schema
-                        )
+                    schema_created = st.session_state.db_handler.create_schema_tables(st.session_state.schema)
+                    if not schema_created:
+                        st.error("❌ Failed to create database schema")
+                        return False
+                except Exception as schema_error:
+                    st.error(f"❌ Schema creation failed: {str(schema_error)[:100]}...")
+                    print(f"Schema error: {schema_error}")
+                    return False
+                
+                # Store each table individually with verification
+                total_tables = len(st.session_state.generated_data)
+                tables_successful = 0
+                
+                for table_name, table_data in st.session_state.generated_data.items():
+                    try:
+                        # Clear existing data first
+                        st.session_state.db_handler.clear_table(table_name)
+                        
+                        # Insert new data
+                        success = st.session_state.db_handler.insert_dataframe(table_name, table_data)
                         
                         if success:
-                            total_rows = sum(len(data) for data in st.session_state.generated_data.values())
-                            st.success(f"✅ All {len(st.session_state.generated_data)} tables saved to database ({total_rows} total rows)")
+                            # Verify the data was actually saved by counting rows
+                            saved_count = DataGenerationManager._verify_table_saved(table_name, len(table_data))
+                            
+                            if saved_count == len(table_data):
+                                tables_saved[table_name] = True
+                                tables_successful += 1
+                                print(f"✅ Successfully saved {table_name}: {saved_count} rows")
+                            else:
+                                tables_saved[table_name] = False
+                                print(f"❌ Row count mismatch for {table_name}: expected {len(table_data)}, got {saved_count}")
                         else:
-                            st.warning(f"⚠️ Generated data successfully but failed to store in database. Data is still available in the UI.")
-                    else:
-                        st.warning("⚠️ Failed to create database tables due to schema issues. Generated data is available in the UI but not saved to database.")
-                        
-                except Exception as schema_error:
-                    # Schema has issues (like missing primary keys), but we still have the generated data
-                    st.warning(f"⚠️ Database schema issue: {str(schema_error)[:100]}... Generated data is available in the UI.")
-                    print(f"Schema error: {schema_error}")
+                            tables_saved[table_name] = False
+                            print(f"❌ Failed to insert data for {table_name}")
+                            
+                    except Exception as table_error:
+                        tables_saved[table_name] = False
+                        print(f"❌ Error saving {table_name}: {table_error}")
+                
+                # Report results
+                if tables_successful == total_tables:
+                    total_rows = sum(len(data) for data in st.session_state.generated_data.values())
+                    st.success(f"✅ All {total_tables} tables saved to database ({total_rows} total rows)")
+                    return True
+                elif tables_successful > 0:
+                    failed_tables = [name for name, success in tables_saved.items() if not success]
+                    st.warning(f"⚠️ {tables_successful}/{total_tables} tables saved. Failed: {', '.join(failed_tables)}")
+                    return False
+                else:
+                    st.error("❌ No tables were saved to database")
+                    return False
                     
         except Exception as e:
-            st.warning(f"⚠️ Database storage error: {str(e)[:100]}... Generated data is still available in the UI.")
+            st.error(f"❌ Database storage error: {str(e)[:100]}...")
             print(f"Database storage error: {e}")
+            return False
+    
+    @staticmethod
+    def _verify_table_saved(table_name: str, expected_count: int) -> int:
+        """Verify that table data was saved correctly by counting rows."""
+        try:
+            with st.session_state.db_handler.get_connection() as conn:
+                result = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+                count = result.fetchone()[0]
+                return count
+        except Exception as e:
+            print(f"❌ Failed to verify {table_name}: {e}")
+            return 0
     
     @staticmethod
     def _store_table_in_database(table_name: str, data):
