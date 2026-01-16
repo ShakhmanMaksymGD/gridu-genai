@@ -13,6 +13,10 @@ from src.ui.chat_ui import ChatUIManager
 def render_data_generation_page():
     """Render the main data generation page."""
     
+    # Initialize loading state if not present
+    if 'data_generation_loading' not in st.session_state:
+        st.session_state.data_generation_loading = False
+    
     # Main prompt area
     st.markdown("**Prompt**")
     user_instructions = st.text_input(
@@ -33,8 +37,18 @@ def render_data_generation_page():
     
     # Main Generate button (only show if schema is loaded and no data exists)
     if st.session_state.schema and not st.session_state.generated_data:
-        if st.button("Generate", type="primary", width="stretch"):
-            DataGenerationManager.generate_data(20, temperature, user_instructions, 42, max_tokens)
+        # Disable button during loading
+        button_disabled = st.session_state.data_generation_loading
+        button_text = "Generating..." if st.session_state.data_generation_loading else "Generate"
+        
+        if st.button(button_text, type="primary", width="stretch", disabled=button_disabled):
+            st.session_state.data_generation_loading = True
+            st.rerun()
+    
+    # Handle data generation when loading state is active
+    if st.session_state.data_generation_loading and st.session_state.schema and not st.session_state.generated_data:
+        DataGenerationManager.generate_data(12, temperature, user_instructions, 42, max_tokens)
+        st.session_state.data_generation_loading = False
 
 
 def render_talk_to_data_page():

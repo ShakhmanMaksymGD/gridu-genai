@@ -5,7 +5,6 @@ Handles DDL file upload and processing.
 """
 import streamlit as st
 from src.utils.ddl_parser import parse_ddl_content
-from src.utils.langfuse_observer import log_user_action
 from src.ui.session_manager import SessionManager
 
 
@@ -47,15 +46,6 @@ class FileUploadManager:
                 content = uploaded_file.read().decode('utf-8')
                 schema = parse_ddl_content(content)
                 st.session_state.schema = schema
-                
-                # Log user action
-                log_user_action("schema_uploaded", {
-                    "file_name": uploaded_file.name,
-                    "file_size": uploaded_file.size,
-                    "tables_count": len(schema.tables),
-                    "table_names": list(schema.tables.keys())
-                })
-                
                 st.success(f"✅ Successfully parsed {len(schema.tables)} tables")
             except Exception as e:
                 st.error(f"❌ Failed to parse DDL: {e}")

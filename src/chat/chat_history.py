@@ -27,8 +27,7 @@ class ChatHistoryManager:
             sessions_ddl = """
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 session_id VARCHAR(36) PRIMARY KEY,
-                title VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                title VARCHAR(255) NOT NULL,                browser_session_id VARCHAR(36),                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 message_count INTEGER DEFAULT 0,
                 metadata JSONB
@@ -54,6 +53,7 @@ class ChatHistoryManager:
             # Create indexes
             indexes_ddl = """
             CREATE INDEX IF NOT EXISTS idx_chat_sessions_created_at ON chat_sessions(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_browser_id ON chat_sessions(browser_session_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp ON chat_messages(timestamp);
             """
@@ -69,14 +69,14 @@ class ChatHistoryManager:
         except Exception as e:
             print(f"❌ Error creating chat history tables: {e}")
     
-    def create_session(self, title: str, metadata: Optional[Dict] = None) -> str:
+    def create_session(self, title: str, browser_session_id: Optional[str] = None, metadata: Optional[Dict] = None) -> str:
         """Create a new chat session and return session_id."""
         session_id = str(uuid.uuid4())
         
         try:
             query = """
-            INSERT INTO chat_sessions (session_id, title, metadata)
-            VALUES (:session_id, :title, :metadata)
+            INSERT INTO chat_sessions (session_id, title, browser_session_id, metadata)
+            VALUES (:session_id, :title, :browser_session_id, :metadata)
             """
             
             with self.db_handler.get_connection() as conn:
@@ -85,6 +85,7 @@ class ChatHistoryManager:
                     {
                         'session_id': session_id,
                         'title': title,
+                        'browser_session_id': browser_session_id,
                         'metadata': json.dumps(metadata or {})
                     }
                 )
@@ -96,6 +97,36 @@ class ChatHistoryManager:
         except Exception as e:
             print(f"❌ Error creating chat session: {e}")
             return str(uuid.uuid4())  # Fallback to memory-only session
+    
+    def create_session_with_id(self, session_id: str, title: str, browser_session_id: Optional[str] = None, metadata: Optional[Dict] = None) -> str:
+        """Create a new chat session with a specific session_id."""
+        try:
+            query = """
+            INSERT INTO chat_sessions (session_id, title, browser_session_id, metadata)
+            VALUES (:session_id, :title, :browser_session_id, :metadata)
+            ON CONFLICT (session_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                updated_at = CURRENT_TIMESTAMP
+            """
+            
+            with self.db_handler.get_connection() as conn:
+                conn.execute(
+                    text(query),
+                    {
+                        'session_id': session_id,
+                        'title': title,
+                        'browser_session_id': browser_session_id,
+                        'metadata': json.dumps(metadata or {})
+                    }
+                )
+                conn.commit()
+            
+            print(f"✅ Created/updated chat session: {session_id}")
+            return session_id
+            
+        except Exception as e:
+            print(f"❌ Error creating chat session with ID: {e}")
+            raise e
     
     def save_message(
         self,
@@ -179,7 +210,7 @@ class ChatHistoryManager:
         """Get all chat sessions ordered by most recent."""
         try:
             query = """
-            SELECT session_id, title, created_at, updated_at, message_count
+            SELECT session_id, title, created_at, updated_at, message_count, browser_session_id
             FROM chat_sessions
             ORDER BY updated_at DESC
             """
@@ -194,13 +225,44 @@ class ChatHistoryManager:
                         'title': row[1],
                         'created_at': row[2],
                         'updated_at': row[3],
-                        'message_count': row[4] or 0
+                        'message_count': row[4] or 0,
+                        'browser_session_id': row[5]
                     })
                 
                 return sessions
                 
         except Exception as e:
             print(f"❌ Error getting chat sessions: {e}")
+            return []
+    
+    def get_sessions_by_browser_id(self, browser_session_id: str) -> List[Dict]:
+        """Get all chat sessions for a specific browser session ID."""
+        try:
+            query = """
+            SELECT session_id, title, created_at, updated_at, message_count, browser_session_id
+            FROM chat_sessions
+            WHERE browser_session_id = :browser_session_id
+            ORDER BY updated_at DESC
+            """
+            
+            with self.db_handler.get_connection() as conn:
+                result = conn.execute(text(query), {'browser_session_id': browser_session_id})
+                sessions = []
+                
+                for row in result:
+                    sessions.append({
+                        'session_id': row[0],
+                        'title': row[1],
+                        'created_at': row[2],
+                        'updated_at': row[3],
+                        'message_count': row[4] or 0,
+                        'browser_session_id': row[5]
+                    })
+                
+                return sessions
+                
+        except Exception as e:
+            print(f"❌ Error getting sessions by browser ID: {e}")
             return []
     
     def get_session_messages(self, session_id: str) -> List[Dict]:

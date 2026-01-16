@@ -20,9 +20,9 @@ import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
 
 from ..database.postgres_handler import DatabaseHandler
-from ..utils.langfuse_observer import observer, log_user_action
+from ..utils.langfuse_observer import observer
+from ..utils.session_utils import get_constant_session_id
 from config.settings import settings
-
 
 @dataclass
 class ChatMessage:
@@ -95,30 +95,19 @@ class DataVisualizer:
     def create_visualization(df: pd.DataFrame, chart_type: str = "auto", title: str = "") -> Optional[str]:
         """Create visualization from DataFrame and return as base64 string."""
         if df.empty:
-            print("DEBUG: DataFrame is empty")
             return None
         
         try:
-            print(f"DEBUG: Creating visualization with chart_type={chart_type}, df shape={df.shape}")
-            print(f"DEBUG: DataFrame columns: {list(df.columns)}")
-            print(f"DEBUG: DataFrame dtypes BEFORE conversion: {df.dtypes.to_dict()}")
+            # Analyze original data types
+            original_types = DataVisualizer._detect_data_types(df)
+            print(f"📊 Original data types detected: {original_types}")
             
-            # Convert numeric-like columns to proper numeric types
-            df = df.copy()  # Don't modify original
-            for col in df.columns:
-                # Try to convert to numeric, ignore errors for truly non-numeric columns
-                if df[col].dtype == 'object':  # String columns that might be numeric
-                    print(f"DEBUG: Attempting to convert {col} from object to numeric")
-                    print(f"DEBUG: Sample values for {col}: {df[col].head().tolist()}")
-                    numeric_converted = pd.to_numeric(df[col], errors='coerce')
-                    # Only use conversion if we didn't lose too much data (less than 50% NaNs)
-                    if numeric_converted.notna().sum() >= len(df) * 0.5:
-                        df[col] = numeric_converted
-                        print(f"DEBUG: Successfully converted {col} to numeric")
-                    else:
-                        print(f"DEBUG: Kept {col} as object (too many conversion errors)")
+            # Preprocess data to convert strings to appropriate numeric types
+            df_processed = DataVisualizer._preprocess_dataframe(df)
             
-            print(f"DEBUG: DataFrame dtypes AFTER conversion: {df.dtypes.to_dict()}")
+            # Analyze processed data types
+            processed_types = DataVisualizer._detect_data_types(df_processed)
+            print(f"📊 After preprocessing: {processed_types}")
             
             # Set style
             plt.style.use('seaborn-v0_8')
@@ -126,23 +115,21 @@ class DataVisualizer:
             
             # Determine chart type if auto
             if chart_type == "auto":
-                chart_type = DataVisualizer._determine_chart_type(df)
-                print(f"DEBUG: Auto-determined chart type: {chart_type}")
+                chart_type = DataVisualizer._determine_chart_type(df_processed)
+                print(f"📈 Auto-selected chart type: {chart_type}")
             
             # Create visualization based on type
             if chart_type == "bar":
-                DataVisualizer._create_bar_chart(df, ax, title)
+                DataVisualizer._create_bar_chart(df_processed, ax, title)
             elif chart_type == "line":
-                DataVisualizer._create_line_chart(df, ax, title)
+                DataVisualizer._create_line_chart(df_processed, ax, title)
             elif chart_type == "scatter":
-                DataVisualizer._create_scatter_plot(df, ax, title)
+                DataVisualizer._create_scatter_plot(df_processed, ax, title)
             elif chart_type == "histogram":
-                DataVisualizer._create_histogram(df, ax, title)
+                DataVisualizer._create_histogram(df_processed, ax, title)
             else:
                 # Default to bar chart
-                DataVisualizer._create_bar_chart(df, ax, title)
-            
-            print("DEBUG: Chart created, converting to base64...")
+                DataVisualizer._create_bar_chart(df_processed, ax, title)
             
             # Convert to base64
             buffer = io.BytesIO()
@@ -152,17 +139,87 @@ class DataVisualizer:
             buffer.close()
             plt.close()
             
-            base64_result = base64.b64encode(plot_data).decode()
-            print(f"DEBUG: Base64 conversion successful, length: {len(base64_result)}")
-            
-            return base64_result
+            print(f"✅ Visualization created successfully ({len(plot_data)} bytes)")
+            return base64.b64encode(plot_data).decode()
             
         except Exception as e:
-            print(f"ERROR: Error creating visualization: {e}")
+            print(f"❌ Error creating visualization: {e}")
             import traceback
-            print(f"ERROR: Full traceback: {traceback.format_exc()}")
+            print(f"❌ Visualization error traceback: {traceback.format_exc()}")
             plt.close()
             return None
+    
+    @staticmethod
+    def _preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """Preprocess DataFrame to convert string numbers to numeric types."""
+        df_copy = df.copy()
+        
+        for col in df_copy.columns:
+            # Skip if already numeric
+            if pd.api.types.is_numeric_dtype(df_copy[col]):
+                continue
+                
+            # Try to convert to numeric
+            try:
+                # First, handle common cases where numbers might be stored as strings
+                if df_copy[col].dtype == 'object':
+                    # Clean the column: strip whitespace, handle nulls
+                    cleaned_series = df_copy[col].astype(str).str.strip()
+                    
+                    # Replace common non-numeric indicators
+                    cleaned_series = cleaned_series.replace(['', 'null', 'NULL', 'None', 'nan', 'NaN'], pd.NA)
+                    
+                    # Try to convert to numeric
+                    numeric_series = pd.to_numeric(cleaned_series, errors='coerce')
+                    
+                    # If we successfully converted most values (more than 50%), use numeric
+                    non_null_original = df_copy[col].notna().sum()
+                    non_null_converted = numeric_series.notna().sum()
+                    
+                    if non_null_original > 0 and (non_null_converted / non_null_original) >= 0.5:
+                        df_copy[col] = numeric_series
+                        print(f"✅ Converted column '{col}' to numeric ({non_null_converted}/{non_null_original} values)")
+                    else:
+                        print(f"ℹ️ Keeping column '{col}' as categorical ({non_null_converted}/{non_null_original} convertible to numeric)")
+                        
+            except Exception as e:
+                print(f"⚠️ Could not convert column '{col}' to numeric: {e}")
+                continue
+        
+        return df_copy
+    
+    @staticmethod
+    def _detect_data_types(df: pd.DataFrame) -> Dict[str, str]:
+        """Analyze and report the detected data types in the DataFrame."""
+        type_info = {}
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                type_info[col] = "numeric"
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                type_info[col] = "datetime"
+            elif df[col].dtype == 'bool':
+                type_info[col] = "boolean"
+            else:
+                # Check if it might be convertible to numeric
+                try:
+                    non_null_count = df[col].notna().sum()
+                    if non_null_count > 0:
+                        cleaned = df[col].astype(str).str.strip().replace(['', 'null', 'NULL', 'None', 'nan', 'NaN'], pd.NA)
+                        numeric_converted = pd.to_numeric(cleaned, errors='coerce').notna().sum()
+                        conversion_rate = numeric_converted / non_null_count if non_null_count > 0 else 0
+                        
+                        if conversion_rate >= 0.8:
+                            type_info[col] = f"text_numeric ({conversion_rate:.1%} convertible)"
+                        elif conversion_rate >= 0.3:
+                            type_info[col] = f"mixed ({conversion_rate:.1%} numeric)"
+                        else:
+                            type_info[col] = "text_categorical"
+                    else:
+                        type_info[col] = "empty"
+                except:
+                    type_info[col] = "text_categorical"
+        
+        return type_info
     
     @staticmethod
     def _determine_chart_type(df: pd.DataFrame) -> str:
@@ -182,61 +239,48 @@ class DataVisualizer:
     @staticmethod
     def _create_bar_chart(df: pd.DataFrame, ax, title: str):
         """Create a bar chart."""
-        print(f"DEBUG: _create_bar_chart called with df shape: {df.shape}")
-        
         numeric_cols = df.select_dtypes(include=['number']).columns
         categorical_cols = df.select_dtypes(include=['object', 'category']).columns
-        
-        print(f"DEBUG: Numeric columns: {list(numeric_cols)}")
-        print(f"DEBUG: Categorical columns: {list(categorical_cols)}")
         
         if len(categorical_cols) > 0 and len(numeric_cols) > 0:
             x_col = categorical_cols[0]
             y_col = numeric_cols[0]
             
-            print(f"DEBUG: Using x_col={x_col}, y_col={y_col}")
+            # Clean data: remove rows with NaN values in key columns
+            df_clean = df.dropna(subset=[x_col, y_col])
             
             # Limit to top 20 categories for readability
-            if len(df) > 20:
-                df_plot = df.nlargest(20, y_col)
+            if len(df_clean) > 20:
+                df_plot = df_clean.nlargest(20, y_col)
             else:
-                df_plot = df
+                df_plot = df_clean
             
-            # Ensure numeric column is properly converted
-            df_plot = df_plot.copy()
-            df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors='coerce')
-            
-            print(f"DEBUG: After numeric conversion, y_col values: {df_plot[y_col].head().tolist()}")
-            print(f"DEBUG: y_col sum: {df_plot[y_col].sum()}")
-            
-            # Remove rows with NaN values in y column
-            df_plot = df_plot.dropna(subset=[y_col])
-            
-            print(f"DEBUG: After dropna, df_plot shape: {df_plot.shape}")
-            
-            if len(df_plot) == 0 or df_plot[y_col].sum() == 0:
-                print("DEBUG: No valid data or zero sum, showing error message")
-                ax.text(0.5, 0.5, 'No valid data for chart', 
-                       ha='center', va='center', transform=ax.transAxes)
+            # Ensure we have data to plot
+            if len(df_plot) > 0:
+                sns.barplot(data=df_plot, x=x_col, y=y_col, ax=ax)
+                ax.set_title(title or f"{y_col} by {x_col}")
+                ax.tick_params(axis='x', rotation=45)
+            else:
+                ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=12)
                 ax.set_title(title or "No Data Available")
-                return
-            
-            print("DEBUG: Creating seaborn barplot...")
-            sns.barplot(data=df_plot, x=x_col, y=y_col, ax=ax)
-            ax.set_title(title or f"{y_col} by {x_col}")
-            ax.tick_params(axis='x', rotation=45)
-            print("DEBUG: Seaborn barplot created successfully")
         else:
-            print("DEBUG: Using fallback numeric plot")
             # Fallback: just plot the first numeric column
             if len(numeric_cols) > 0:
-                col_data = pd.to_numeric(df[numeric_cols[0]], errors='coerce').dropna()
-                if len(col_data) > 0:
-                    col_data.plot(kind='bar', ax=ax)
-                    ax.set_title(title or f"{numeric_cols[0]} Distribution")
+                col = numeric_cols[0]
+                df_clean = df.dropna(subset=[col])
+                if len(df_clean) > 0:
+                    df_clean[col].plot(kind='bar', ax=ax)
+                    ax.set_title(title or f"{col} Distribution")
                 else:
-                    ax.text(0.5, 0.5, 'No valid numeric data', 
-                           ha='center', va='center', transform=ax.transAxes)
+                    ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                           ha='center', va='center', fontsize=12)
+                    ax.set_title(title or "No Data Available")
+            else:
+                # No numeric columns found - show first few rows as text
+                ax.text(0.5, 0.5, f'No numeric data found for visualization.\nColumns: {list(df.columns)}', 
+                       transform=ax.transAxes, ha='center', va='center', fontsize=10)
+                ax.set_title(title or "Data Preview")
     
     @staticmethod
     def _create_line_chart(df: pd.DataFrame, ax, title: str):
@@ -245,11 +289,28 @@ class DataVisualizer:
         
         if len(numeric_cols) >= 2:
             x_col, y_col = numeric_cols[0], numeric_cols[1]
-            df.plot(x=x_col, y=y_col, kind='line', ax=ax)
-            ax.set_title(title or f"{y_col} vs {x_col}")
+            df_clean = df.dropna(subset=[x_col, y_col])
+            if len(df_clean) > 0:
+                df_clean.plot(x=x_col, y=y_col, kind='line', ax=ax, marker='o')
+                ax.set_title(title or f"{y_col} vs {x_col}")
+            else:
+                ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(title or "No Data Available")
         elif len(numeric_cols) == 1:
-            df[numeric_cols[0]].plot(kind='line', ax=ax)
-            ax.set_title(title or f"{numeric_cols[0]} Trend")
+            col = numeric_cols[0]
+            df_clean = df.dropna(subset=[col])
+            if len(df_clean) > 0:
+                df_clean[col].plot(kind='line', ax=ax, marker='o')
+                ax.set_title(title or f"{col} Trend")
+            else:
+                ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(title or "No Data Available")
+        else:
+            ax.text(0.5, 0.5, f'No numeric data found for line chart.\nColumns: {list(df.columns)}', 
+                   transform=ax.transAxes, ha='center', va='center', fontsize=10)
+            ax.set_title(title or "Data Preview")
     
     @staticmethod
     def _create_scatter_plot(df: pd.DataFrame, ax, title: str):
@@ -258,8 +319,18 @@ class DataVisualizer:
         
         if len(numeric_cols) >= 2:
             x_col, y_col = numeric_cols[0], numeric_cols[1]
-            sns.scatterplot(data=df, x=x_col, y=y_col, ax=ax)
-            ax.set_title(title or f"{y_col} vs {x_col}")
+            df_clean = df.dropna(subset=[x_col, y_col])
+            if len(df_clean) > 0:
+                sns.scatterplot(data=df_clean, x=x_col, y=y_col, ax=ax, alpha=0.7)
+                ax.set_title(title or f"{y_col} vs {x_col}")
+            else:
+                ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(title or "No Data Available")
+        else:
+            ax.text(0.5, 0.5, f'Need at least 2 numeric columns for scatter plot.\nFound: {len(numeric_cols)} numeric columns', 
+                   transform=ax.transAxes, ha='center', va='center', fontsize=10)
+            ax.set_title(title or "Insufficient Numeric Data")
     
     @staticmethod
     def _create_histogram(df: pd.DataFrame, ax, title: str):
@@ -268,10 +339,26 @@ class DataVisualizer:
         
         if len(numeric_cols) > 0:
             col = numeric_cols[0]
-            df[col].hist(bins=20, ax=ax)
-            ax.set_title(title or f"{col} Distribution")
-            ax.set_xlabel(col)
-            ax.set_ylabel("Frequency")
+            df_clean = df.dropna(subset=[col])
+            if len(df_clean) > 0:
+                # Determine appropriate number of bins based on data size
+                n_bins = min(20, max(5, int(len(df_clean) / 10)))
+                df_clean[col].hist(bins=n_bins, ax=ax, alpha=0.7, edgecolor='black')
+                ax.set_title(title or f"{col} Distribution")
+                ax.set_xlabel(col)
+                ax.set_ylabel("Frequency")
+                # Add some statistics to the plot
+                mean_val = df_clean[col].mean()
+                ax.axvline(mean_val, color='red', linestyle='--', alpha=0.8, label=f'Mean: {mean_val:.2f}')
+                ax.legend()
+            else:
+                ax.text(0.5, 0.5, 'No valid data to plot', transform=ax.transAxes, 
+                       ha='center', va='center', fontsize=12)
+                ax.set_title(title or "No Data Available")
+        else:
+            ax.text(0.5, 0.5, f'No numeric data found for histogram.\nColumns: {list(df.columns)}', 
+                   transform=ax.transAxes, ha='center', va='center', fontsize=10)
+            ax.set_title(title or "Data Preview")
 
 
 class ChatInterface:
@@ -284,16 +371,21 @@ class ChatInterface:
         self.available_tables = {}
         self.current_session_id = None
         self.current_session_title = "New Conversation"
+        # Use constant session ID for testing
+        self.browser_session_id = get_constant_session_id()
         
         # Initialize chat history manager
         from .chat_history import ChatHistoryManager
         self.history_manager = ChatHistoryManager(db_handler)
         
+        # Create tables first, before any session operations
+        self.history_manager.create_tables()
+        
         self.initialize_gemini()
         self.load_schema_info()
         
-        # Load the most recent session automatically
-        self._load_most_recent_session()
+        # Initialize with constant session ID for testing
+        self._initialize_constant_session()
     
     def initialize_gemini(self):
         """Initialize Gemini model for chat."""
@@ -379,6 +471,24 @@ class ChatInterface:
         # Security checks
         is_injection, injection_reason = SecurityGuard.detect_prompt_injection(user_message)
         if is_injection:
+            # Log prompt injection attempt to Langfuse
+            trace_id = observer.create_trace(
+                name="prompt_injection_detected",
+                input=user_message,
+                user_id=self.browser_session_id,
+                session_id=self.current_session_id,
+                metadata={"violation_type": "prompt_injection", "reason": injection_reason}
+            )
+            observer.log_generation(
+                trace_id=trace_id,
+                name="security_violation",
+                model="security_guard",
+                input_messages=[{"role": "user", "content": user_message}],
+                output_text="Prompt injection detected",
+                metadata={"injection_reason": injection_reason}
+            )
+            observer.flush()
+            
             return ChatMessage(
                 role="assistant",
                 content="⚠️ I detected a potential security issue with your request. Please rephrase your question about the data.",
@@ -386,73 +496,100 @@ class ChatInterface:
                 error="Security violation detected"
             )
         
+        # Generate SQL response using AI
         try:
-            # Create trace for this conversation
+            # Create Langfuse trace for observability
             trace_id = observer.create_trace(
-                name="chat_query",
+                name="user_query",
+                input=user_message,
+                user_id=self.browser_session_id,
+                session_id=self.current_session_id,
                 metadata={
-                    "user_query": user_message,
-                    "session_id": self.current_session_id,
+                    "conversation_turn": len(self.conversation_history) + 1,
                     "session_title": self.current_session_title,
-                    "available_tables": list(self.available_tables.keys()),
-                    "conversation_length": len(self.conversation_history)
+                    "available_tables": list(self.available_tables.keys())
                 }
             )
             
-            # Generate SQL query using Gemini
+            # Generate AI response
             response = await self._generate_sql_response(user_message)
             
-            if response and response.candidates:
-                # Check if function calling was used
-                candidate = response.candidates[0]
-                
-                if candidate.content and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'function_call') and part.function_call:
-                            # Extract function call result
-                            function_call = part.function_call
-                            if function_call.name == "generate_sql_query":
-                                args = function_call.args
-                                sql_query = args.get('sql_query', '')
-                                explanation = args.get('explanation', '')
-                                viz_type = args.get('visualization_type', 'none')
-                                
-                                # Security check for generated SQL
-                                is_safe, safety_reason = SecurityGuard.is_safe_query(sql_query)
-                                if not is_safe:
-                                    return ChatMessage(
-                                        role="assistant",
-                                        content=f"I cannot execute this query for security reasons: {safety_reason}",
-                                        timestamp=datetime.utcnow(),
-                                        error=safety_reason
-                                    )
-                                
-                                # Execute query and create response
-                                return await self._execute_query_and_respond(
-                                    user_message, sql_query, explanation, viz_type, trace_id
+            # Extract function call result
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'function_call'):
+                        function_call = part.function_call
+                        if function_call.name == "generate_sql_query":
+                            args = function_call.args
+                            
+                            # Extract parameters
+                            sql_query = args.get("sql_query", "")
+                            explanation = args.get("explanation", "")
+                            viz_type = args.get("visualization_type", "none")
+                            
+                            # Security check on generated SQL
+                            is_safe, safety_reason = SecurityGuard.is_safe_query(sql_query)
+                            if not is_safe:
+                                # Log security violation to Langfuse
+                                observer.log_generation(
+                                    trace_id=trace_id,
+                                    name="security_violation",
+                                    model="security_guard",
+                                    input_messages=[{"role": "user", "content": user_message}],
+                                    output_text=f"Query blocked: {safety_reason}",
+                                    metadata={"sql_query": sql_query, "violation_reason": safety_reason}
                                 )
-                        else:
-                            # Regular text response (no function call)
-                            text_content = part.text if hasattr(part, 'text') else str(part)
-                            return ChatMessage(
-                                role="assistant",
-                                content=text_content,
-                                timestamp=datetime.utcnow()
+                                observer.flush()
+                                
+                                return ChatMessage(
+                                    role="assistant",
+                                    content=f"⚠️ The generated query was blocked for security reasons: {safety_reason}",
+                                    timestamp=datetime.utcnow(),
+                                    error=f"Security violation: {safety_reason}"
+                                )
+                            
+                            # Execute query and return response
+                            return await self._execute_query_and_respond(
+                                user_question=user_message,
+                                sql_query=sql_query,
+                                explanation=explanation,
+                                viz_type=viz_type,
+                                trace_id=trace_id
                             )
             
-            # Fallback response
+            # Fallback if no function call was made
+            observer.log_generation(
+                trace_id=trace_id,
+                name="no_function_call",
+                model="gemini-2.0-flash-exp",
+                input_messages=[{"role": "user", "content": user_message}],
+                output_text="No valid function call generated",
+                metadata={"error_type": "no_function_call", "response_candidates": len(response.candidates) if response.candidates else 0}
+            )
+            observer.flush()
+            
             return ChatMessage(
                 role="assistant",
-                content="I couldn't process your request. Please try rephrasing your question about the data.",
+                content="I'm sorry, I couldn't understand your request. Could you please rephrase your question about the data?",
                 timestamp=datetime.utcnow(),
-                error="No valid response generated"
+                error="No valid function call generated"
             )
             
         except Exception as e:
-            print(f"Error processing message: {e}")
+            # Log error to Langfuse
+            observer.log_generation(
+                trace_id=trace_id if 'trace_id' in locals() else None,
+                name="processing_error",
+                model="chat_interface",
+                input_messages=[{"role": "user", "content": user_message}],
+                output_text=f"Error: {str(e)}",
+                metadata={"error_type": type(e).__name__, "error_message": str(e)}
+            )
+            observer.flush()
+            
             return ChatMessage(
                 role="assistant",
-                content=f"Sorry, I encountered an error: {str(e)}",
+                content=f"Sorry, I encountered an error while processing your request: {str(e)}",
                 timestamp=datetime.utcnow(),
                 error=str(e)
             )
@@ -539,22 +676,22 @@ class ChatInterface:
             
             # Log to Langfuse with comprehensive data
             if trace_id:
-                # Prepare detailed output data
-                output_data = {
-                    "response_content": content,
-                    "sql_query": sql_query,
-                    "execution_result": {
-                        "rows_returned": len(result_df),
-                        "columns": list(result_df.columns) if not result_df.empty else [],
-                        "data_types": str(result_df.dtypes.to_dict()) if not result_df.empty else {},
-                        "sample_data": result_df.head(3).to_dict('records') if not result_df.empty else []
-                    },
-                    "visualization": {
-                        "type": viz_type,
-                        "created": visualization is not None,
-                        "size_bytes": len(visualization) if visualization else 0
-                    }
-                }
+                # # Prepare detailed output data
+                # output_data = {
+                #     "response_content": content,
+                #     "sql_query": sql_query,
+                #     "execution_result": {
+                #         "rows_returned": len(result_df),
+                #         "columns": list(result_df.columns) if not result_df.empty else [],
+                #         "data_types": str(result_df.dtypes.to_dict()) if not result_df.empty else {},
+                #         "sample_data": result_df.head(3).to_dict('records') if not result_df.empty else []
+                #     },
+                #     "visualization": {
+                #         "type": viz_type,
+                #         "created": visualization is not None,
+                #         "size_bytes": len(visualization) if visualization else 0
+                #     }
+                # }
                 
                 observer.log_generation(
                     trace_id=trace_id,
@@ -613,40 +750,7 @@ class ChatInterface:
             )
             
         except Exception as e:
-            error_msg = f"Error executing query: {str(e)}\n\n**SQL Query:**\n```sql\n{sql_query}\n```"
-            
-            # Log error to Langfuse if trace exists
-            if 'trace_id' in locals():
-                observer.log_generation(
-                    trace_id=trace_id,
-                    name="ai_conversation_error",
-                    model="gemini-2.0-flash-exp",
-                    input_messages=[{"role": "user", "content": user_question}],
-                    output_text=error_msg,
-                    usage={
-                        "prompt_tokens": len(user_question.split()),
-                        "completion_tokens": len(error_msg.split()),
-                        "total_tokens": len(user_question.split()) + len(error_msg.split())
-                    },
-                    metadata={
-                        "conversation_type": "data_query_error",
-                        "error_type": type(e).__name__,
-                        "error_message": str(e),
-                        "sql_query": sql_query,
-                        "ai_output": {
-                            "full_response": error_msg,
-                            "response_length": len(error_msg),
-                            "is_error": True
-                        },
-                        "session_context": {
-                            "session_id": self.current_session_id,
-                            "session_title": self.current_session_title,
-                            "conversation_turn": len(self.conversation_history) + 1
-                        }
-                    }
-                )
-                # Flush to ensure error is logged to Langfuse immediately
-                observer.flush()
+            error_msg = f"Error executing query: {str(e)}\n\n**SQL Query:**\n```sql\n{sql_query}\n```"            
             
             return ChatMessage(
                 role="assistant", 
@@ -696,25 +800,48 @@ class ChatInterface:
         
         return context
     
-    def _load_most_recent_session(self):
-        """Load the most recent chat session automatically."""
+    def _initialize_constant_session(self):
+        """Initialize or load the constant test session."""
         try:
-            sessions = self.history_manager.get_all_sessions()
-            if sessions:
-                # Load the most recently updated session
-                recent_session = sessions[0]  # Already sorted by updated_at DESC
-                session_id = recent_session['session_id']
-                
-                # Load the session
-                success = self.load_session(session_id)
-                if success:
-                    print(f"✅ Auto-loaded recent session: {self.current_session_title}")
-                else:
-                    print("❌ Failed to auto-load recent session")
+            # Try to load the existing constant session
+            success = self.load_session(self.browser_session_id)
+            if success:
+                print(f"✅ Loaded existing session: {self.current_session_title}")
             else:
-                print("ℹ️ No previous sessions found - starting fresh")
+                # Create new session with constant ID
+                self.current_session_id = self.browser_session_id
+                self.current_session_title = "Test Session"
+                self.conversation_history = []
+                
+                # Ensure session exists in database
+                try:
+                    from .chat_history import ChatHistoryManager
+                    result_id = self.history_manager.create_session_with_id(
+                        self.browser_session_id, 
+                        self.current_session_title, 
+                        self.browser_session_id
+                    )
+                    print(f"✅ Created new constant session: {result_id}")
+                except Exception as e:
+                    print(f"❌ Failed to create session: {e}")
+                    print(f"❌ Error type: {type(e).__name__}")
+                    import traceback
+                    print(f"❌ Full traceback: {traceback.format_exc()}")
+                    
+                    # Try to create session without the specific method
+                    try:
+                        print("🔄 Trying alternative session creation...")
+                        self.start_new_session(self.current_session_title)
+                        print(f"✅ Alternative session creation successful: {self.current_session_id}")
+                    except Exception as e2:
+                        print(f"❌ Alternative session creation also failed: {e2}")
+                    
         except Exception as e:
-            print(f"⚠️ Could not auto-load recent session: {e}")
+            print(f"⚠️ Error initializing session: {e}")
+            # Fallback - just set the session ID
+            self.current_session_id = self.browser_session_id
+            self.current_session_title = "Test Session" 
+            self.conversation_history = []
     
     def start_new_session(self, title: Optional[str] = None):
         """Start a new chat session."""

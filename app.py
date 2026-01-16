@@ -41,14 +41,6 @@ def main():
     if not SessionManager.initialize_components():
         st.stop()
     
-    # Create session manager instance for UI components
-    if 'session_manager' not in st.session_state:
-        class SessionManagerInstance:
-            @property
-            def chat_interface(self):
-                return st.session_state.get('chat_interface', None)
-        st.session_state.session_manager = SessionManagerInstance()
-    
     # Render sidebar navigation
     selected_tab = render_sidebar_navigation()
     

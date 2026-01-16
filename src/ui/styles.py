@@ -48,6 +48,13 @@ def apply_custom_css():
     div[data-testid="stFileUploader"] > label > div {
         background-color: #000000 !important;
         color: white !important;
+        border-radius: 4px !important;
+        padding: 0.5rem 1rem !important;
+        border: none !important;
+        cursor: pointer !important;
+    }
+    
+
         border: none !important;
         border-radius: 4px !important;
         padding: 0.5rem 1rem !important;
@@ -63,6 +70,13 @@ def apply_custom_css():
     }
     div[data-testid="stHorizontalBlock"] {
       align-items: center;
+    }
+    div[data-testid="stCode"] > pre {
+        background: #000;
+        color: #fff;
+    }
+    button[data-testid="stCodeCopyButton"] {
+        color: #fff !important;
     }
     </style>
     """, unsafe_allow_html=True)

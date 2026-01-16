@@ -4,7 +4,6 @@ PostgreSQL Database Handler Module
 This module provides functionality to connect to PostgreSQL, create tables,
 insert data, and perform other database operations for the synthetic data application.
 """
-import psycopg2
 import pandas as pd
 from sqlalchemy import create_engine, text, MetaData, Table as SqlAlchemyTable
 from sqlalchemy.orm import sessionmaker
@@ -427,6 +426,71 @@ class DatabaseHandler:
         
         except Exception as e:
             logger.error(f"Failed to clear table {table_name}: {e}")
+            return False
+    
+    def upsert_dataframe(self, table_name: str, df: pd.DataFrame) -> bool:
+        """Update existing records or insert new ones using PostgreSQL's UPSERT (ON CONFLICT)."""
+        try:
+            if df.empty:
+                logger.warning(f"DataFrame for table {table_name} is empty")
+                return True
+            
+            # Clean dataframe
+            df_clean = self._clean_dataframe_for_postgres(df, table_name)
+            
+            # Get table columns - use a simpler approach if get_table_info fails
+            try:
+                table_info = self.get_table_info(table_name)
+                if table_info and table_info.get('columns'):
+                    columns = [col['column_name'] for col in table_info['columns']]
+                else:
+                    # Fallback: use dataframe columns
+                    columns = df_clean.columns.tolist()
+            except Exception as e:
+                logger.warning(f"Could not get table info for {table_name}, using dataframe columns: {e}")
+                columns = df_clean.columns.tolist()
+            
+            if not columns:
+                logger.error(f"No columns found for table {table_name}")
+                return False
+            
+            # Assume first column is primary key for UPSERT
+            primary_key = columns[0]
+            
+            # Build UPSERT query (PostgreSQL specific)
+            columns_str = ', '.join(columns)
+            values_placeholders = ', '.join([f':{col}' for col in columns])
+            update_clauses = ', '.join([f'{col} = EXCLUDED.{col}' for col in columns if col != primary_key])
+            
+            upsert_query = f"""
+                INSERT INTO {table_name} ({columns_str})
+                VALUES ({values_placeholders})
+                ON CONFLICT ({primary_key})
+                DO UPDATE SET {update_clauses}
+            """
+            
+            with self.get_connection() as conn:
+                # Execute upsert for each row
+                for _, row in df_clean.iterrows():
+                    # Convert pandas/numpy types to native Python types
+                    params = {}
+                    for col in columns:
+                        if col in row.index:
+                            value = row[col]
+                            # Convert pandas/numpy types to native Python types
+                            if hasattr(value, 'item'):
+                                value = value.item()
+                            params[col] = value
+                    
+                    conn.execute(text(upsert_query), params)
+                
+                conn.commit()
+                
+            logger.info(f"Upserted {len(df_clean)} rows into {table_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to upsert data into {table_name}: {e}")
             return False
     
     def drop_all_tables(self) -> bool:
