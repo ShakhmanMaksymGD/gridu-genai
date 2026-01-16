@@ -97,7 +97,6 @@ class LangfuseObserver:
     
     def log_generation(
         self,
-        trace_id: str,
         name: str,
         model: str,
         input_messages: List[Dict],
@@ -135,9 +134,6 @@ class LangfuseObserver:
             
             # End the generation
             generation.end()
-            
-            print(f"✅ Successfully logged generation: {name} with ID: {generation_id}")
-            return generation_id
             
         except Exception as e:
             print(f"❌ Failed to log generation to Langfuse: {e}")

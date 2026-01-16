@@ -471,46 +471,16 @@ class ChatInterface:
         # Security checks
         is_injection, injection_reason = SecurityGuard.detect_prompt_injection(user_message)
         if is_injection:
-            # Log prompt injection attempt to Langfuse
-            trace_id = observer.create_trace(
-                name="prompt_injection_detected",
-                input=user_message,
-                user_id=self.browser_session_id,
-                session_id=self.current_session_id,
-                metadata={"violation_type": "prompt_injection", "reason": injection_reason}
-            )
-            observer.log_generation(
-                trace_id=trace_id,
-                name="security_violation",
-                model="security_guard",
-                input_messages=[{"role": "user", "content": user_message}],
-                output_text="Prompt injection detected",
-                metadata={"injection_reason": injection_reason}
-            )
-            observer.flush()
             
             return ChatMessage(
                 role="assistant",
                 content="⚠️ I detected a potential security issue with your request. Please rephrase your question about the data.",
                 timestamp=datetime.utcnow(),
-                error="Security violation detected"
+                error=injection_reason
             )
         
         # Generate SQL response using AI
-        try:
-            # Create Langfuse trace for observability
-            trace_id = observer.create_trace(
-                name="user_query",
-                input=user_message,
-                user_id=self.browser_session_id,
-                session_id=self.current_session_id,
-                metadata={
-                    "conversation_turn": len(self.conversation_history) + 1,
-                    "session_title": self.current_session_title,
-                    "available_tables": list(self.available_tables.keys())
-                }
-            )
-            
+        try:            
             # Generate AI response
             response = await self._generate_sql_response(user_message)
             
@@ -530,17 +500,6 @@ class ChatInterface:
                             # Security check on generated SQL
                             is_safe, safety_reason = SecurityGuard.is_safe_query(sql_query)
                             if not is_safe:
-                                # Log security violation to Langfuse
-                                observer.log_generation(
-                                    trace_id=trace_id,
-                                    name="security_violation",
-                                    model="security_guard",
-                                    input_messages=[{"role": "user", "content": user_message}],
-                                    output_text=f"Query blocked: {safety_reason}",
-                                    metadata={"sql_query": sql_query, "violation_reason": safety_reason}
-                                )
-                                observer.flush()
-                                
                                 return ChatMessage(
                                     role="assistant",
                                     content=f"⚠️ The generated query was blocked for security reasons: {safety_reason}",
@@ -554,19 +513,7 @@ class ChatInterface:
                                 sql_query=sql_query,
                                 explanation=explanation,
                                 viz_type=viz_type,
-                                trace_id=trace_id
                             )
-            
-            # Fallback if no function call was made
-            observer.log_generation(
-                trace_id=trace_id,
-                name="no_function_call",
-                model="gemini-2.0-flash-exp",
-                input_messages=[{"role": "user", "content": user_message}],
-                output_text="No valid function call generated",
-                metadata={"error_type": "no_function_call", "response_candidates": len(response.candidates) if response.candidates else 0}
-            )
-            observer.flush()
             
             return ChatMessage(
                 role="assistant",
@@ -575,18 +522,7 @@ class ChatInterface:
                 error="No valid function call generated"
             )
             
-        except Exception as e:
-            # Log error to Langfuse
-            observer.log_generation(
-                trace_id=trace_id if 'trace_id' in locals() else None,
-                name="processing_error",
-                model="chat_interface",
-                input_messages=[{"role": "user", "content": user_message}],
-                output_text=f"Error: {str(e)}",
-                metadata={"error_type": type(e).__name__, "error_message": str(e)}
-            )
-            observer.flush()
-            
+        except Exception as e:            
             return ChatMessage(
                 role="assistant",
                 content=f"Sorry, I encountered an error while processing your request: {str(e)}",
@@ -652,7 +588,6 @@ class ChatInterface:
         sql_query: str, 
         explanation: str, 
         viz_type: str,
-        trace_id: Optional[str] = None
     ) -> ChatMessage:
         """Execute SQL query and generate response with optional visualization."""
         
@@ -675,70 +610,51 @@ class ChatInterface:
                 visualization = DataVisualizer.create_visualization(result_df, viz_type, title)
             
             # Log to Langfuse with comprehensive data
-            if trace_id:
-                # # Prepare detailed output data
-                # output_data = {
-                #     "response_content": content,
-                #     "sql_query": sql_query,
-                #     "execution_result": {
-                #         "rows_returned": len(result_df),
-                #         "columns": list(result_df.columns) if not result_df.empty else [],
-                #         "data_types": str(result_df.dtypes.to_dict()) if not result_df.empty else {},
-                #         "sample_data": result_df.head(3).to_dict('records') if not result_df.empty else []
-                #     },
-                #     "visualization": {
-                #         "type": viz_type,
-                #         "created": visualization is not None,
-                #         "size_bytes": len(visualization) if visualization else 0
-                #     }
-                # }
-                
-                observer.log_generation(
-                    trace_id=trace_id,
-                    name="ai_conversation",
-                    model="gemini-2.0-flash-exp",
-                    input_messages=[{
-                        "role": "user", 
-                        "content": user_question,
-                        "context": "Database query with available tables: " + ", ".join(self.available_tables.keys())
-                    }],
-                    output_text=content,
-                    usage={
-                        "prompt_tokens": len(user_question.split()),
-                        "completion_tokens": len(content.split()),
-                        "total_tokens": len(user_question.split()) + len(content.split())
+            observer.log_generation(
+                name="ai_conversation",
+                model="gemini-2.0-flash-exp",
+                input_messages=[{
+                    "role": "user", 
+                    "content": user_question,
+                    "context": "Database query with available tables: " + ", ".join(self.available_tables.keys())
+                }],
+                output_text=content,
+                usage={
+                    "prompt_tokens": len(user_question.split()),
+                    "completion_tokens": len(content.split()),
+                    "total_tokens": len(user_question.split()) + len(content.split())
+                },
+                metadata={
+                    "conversation_type": "data_query",
+                    "sql_query": sql_query,
+                    "explanation": explanation,
+                    "query_performance": {
+                        "rows_returned": len(result_df),
+                        "columns_count": len(result_df.columns) if not result_df.empty else 0,
+                        "has_visualization": visualization is not None,
+                        "visualization_type": viz_type
                     },
-                    metadata={
-                        "conversation_type": "data_query",
-                        "sql_query": sql_query,
-                        "explanation": explanation,
-                        "query_performance": {
-                            "rows_returned": len(result_df),
-                            "columns_count": len(result_df.columns) if not result_df.empty else 0,
-                            "has_visualization": visualization is not None,
-                            "visualization_type": viz_type
-                        },
-                        "data_summary": {
-                            "table_shape": f"{len(result_df)} rows x {len(result_df.columns) if not result_df.empty else 0} columns",
-                            "column_names": list(result_df.columns) if not result_df.empty else [],
-                            "sample_data": result_df.head(2).to_dict('records') if not result_df.empty else []
-                        },
-                        "ai_output": {
-                            "full_response": content,
-                            "response_length": len(content),
-                            "contains_sql": sql_query is not None,
-                            "contains_data": not result_df.empty,
-                            "contains_visualization": visualization is not None
-                        },
-                        "session_context": {
-                            "session_id": self.current_session_id,
-                            "session_title": self.current_session_title,
-                            "conversation_turn": len(self.conversation_history) + 1
-                        }
+                    "data_summary": {
+                        "table_shape": f"{len(result_df)} rows x {len(result_df.columns) if not result_df.empty else 0} columns",
+                        "column_names": list(result_df.columns) if not result_df.empty else [],
+                        "sample_data": result_df.head(2).to_dict('records') if not result_df.empty else []
+                    },
+                    "ai_output": {
+                        "full_response": content,
+                        "response_length": len(content),
+                        "contains_sql": sql_query is not None,
+                        "contains_data": not result_df.empty,
+                        "contains_visualization": visualization is not None
+                    },
+                    "session_context": {
+                        "session_id": self.current_session_id,
+                        "session_title": self.current_session_title,
+                        "conversation_turn": len(self.conversation_history) + 1
                     }
-                )
-                # Flush to ensure data is sent to Langfuse immediately
-                observer.flush()
+                }
+            )
+            # Flush to ensure data is sent to Langfuse immediately
+            observer.flush()
             
             return ChatMessage(
                 role="assistant",
@@ -899,42 +815,3 @@ class ChatInterface:
     def get_all_sessions(self) -> List[Dict]:
         """Get all available chat sessions."""
         return self.history_manager.get_all_sessions()
-    
-    def update_session_title(self, new_title: str) -> bool:
-        """Update the current session title."""
-        if self.current_session_id:
-            success = self.history_manager.update_session_title(self.current_session_id, new_title)
-            if success:
-                self.current_session_title = new_title
-            return success
-        return False
-    
-    def delete_current_session(self) -> bool:
-        """Delete the current chat session."""
-        if self.current_session_id:
-            success = self.history_manager.delete_session(self.current_session_id)
-            if success:
-                self.current_session_id = None
-                self.current_session_title = "New Conversation"
-                self.conversation_history = []
-            return success
-        return False
-    
-    def clear_history(self):
-        """Clear current conversation history (but keep session in DB)."""
-        self.conversation_history = []
-    
-    def get_chat_stats(self) -> Dict[str, Any]:
-        """Get statistics about the chat session."""
-        total_messages = len(self.conversation_history)
-        user_messages = len([m for m in self.conversation_history if m.role == "user"])
-        successful_queries = len([m for m in self.conversation_history if m.sql_query and not m.error])
-        
-        return {
-            "total_messages": total_messages,
-            "user_messages": user_messages,
-            "successful_queries": successful_queries,
-            "error_rate": (total_messages - successful_queries) / max(total_messages, 1),
-            "current_session_id": self.current_session_id,
-            "current_session_title": self.current_session_title
-        }

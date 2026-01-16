@@ -11,7 +11,6 @@ import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import sqlalchemy as sa
 from sqlalchemy import text
 import logging
 
