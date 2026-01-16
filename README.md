@@ -1,10 +1,10 @@
-# Synthetic Data Generation Platform
+# Synthetic Data Generation & Analysis Platform
 
-A powerful AI-driven platform for generating realistic synthetic data from database schemas using Google's Gemini 2.0 Flash.
+A comprehensive AI-driven platform for generating realistic synthetic data from database schemas and querying it with natural language using Google's Gemini 2.0 Flash.
 
 ## Features
 
-### Phase 1 (Completed)
+### Core Features (Completed)
 - 📊 **DDL Schema Parsing**: Parse SQL DDL files and extract table structures, constraints, and relationships
 - 🤖 **AI-Powered Data Generation**: Use Gemini 2.0 Flash with function calling for realistic synthetic data
 - 🔄 **Data Modification**: Modify generated data through natural language instructions
@@ -12,11 +12,15 @@ A powerful AI-driven platform for generating realistic synthetic data from datab
 - 🎯 **Modular UI**: Clean, maintainable Streamlit interface with component-based architecture
 - 📊 **Observability**: Langfuse integration for monitoring and analytics
 - 🐳 **Containerized**: Docker support for easy deployment
+- 💬 **Natural Language Querying**: Talk-to-your-data functionality with conversational AI interface
+- 📈 **Data Visualization**: Auto-generated charts and plots from query results
+- 🔒 **Security Guardrails**: SQL injection protection and prompt injection detection
+- 💾 **Chat History**: Persistent conversation storage and management
 
-### Phase 2 & 3 (Planned)
-- 💬 **Natural Language Querying**: Talk-to-your-data functionality
-- 📈 **Data Visualization**: Charts and plots from query results
-- 🔍 **Advanced Analytics**: Statistical analysis and insights
+### Planned Enhancements
+- 🔍 **Advanced Analytics**: Enhanced statistical analysis and insights
+- 📊 **Custom Visualization Options**: More chart types and customization
+- 🚀 **Performance Optimization**: Query caching and optimization
 
 ## Quick Start
 
@@ -91,8 +95,14 @@ If you prefer to run without Docker:
 - Preview generated tables
 - Data is automatically stored in PostgreSQL
 
-### 4. Modify Data
-- Select any table to modify
+### 4. Query Your Data
+- Navigate to the "💬 Talk to your data" tab
+- Ask questions about your generated data in natural language
+- Examples: "Show me the average salary by department", "Create a chart of employee ages"
+- The AI will generate SQL queries, execute them safely, and create visualizations
+
+### 5. Modify Data
+- In the Data Generation tab, select any table to modify
 - Provide natural language instructions
 - Example: "Make all employees older than 25", "Increase salaries by 10%"
 
@@ -101,6 +111,10 @@ If you prefer to run without Docker:
 ```
 ├── app.py                          # Main Streamlit application (refactored)
 ├── src/
+│   ├── chat/                            # Natural language querying system
+│   │   ├── chat_interface.py            # Main chat interface with AI and visualization
+│   │   ├── chat_history.py              # Chat conversation persistence
+│   │   └── __init__.py                  # Package exports
 │   ├── data_generation/
 │   │   └── synthetic_data_generator.py  # Gemini-powered data generator
 │   ├── database/
@@ -111,37 +125,18 @@ If you prefer to run without Docker:
 │   │   ├── styles.py                    # CSS styling and UI utilities
 │   │   ├── file_upload.py               # File upload handling
 │   │   ├── data_generation.py           # Data generation UI and logic
+│   │   ├── chat_ui.py                   # Chat interface UI components
 │   │   └── pages.py                     # Page components and navigation
 │   └── utils/
 │       ├── ddl_parser.py                # DDL parsing logic
-│       └── langfuse_observer.py         # Observability integration
+│       ├── langfuse_observer.py         # Observability integration
+│       └── session_utils.py             # Session utilities
 ├── config/
 │   └── settings.py                      # Configuration management
 ├── samplers/                            # Sample DDL schemas
 ├── data/                               # Generated data storage
 └── docker-compose.yml                 # Container orchestration
 ```
-
-## Refactored Architecture Benefits
-
-The application has been completely refactored for better maintainability and scalability:
-
-### Modular Design
-- **Separation of Concerns**: Each UI component has a single responsibility
-- **Session Management**: Centralized state handling in `SessionManager`
-- **Component-Based**: Reusable UI components for consistent user experience
-- **Clean Dependencies**: Clear import structure and minimal coupling
-
-### Improved Maintainability
-- **60% Code Reduction**: Main `app.py` reduced from 595 to ~60 lines
-- **Error Isolation**: Issues in one component don't affect others
-- **Easy Testing**: Each module can be tested independently
-- **Team Collaboration**: Multiple developers can work on different modules
-
-### Enhanced Readability
-- **Descriptive Names**: Classes and methods clearly indicate their purpose
-- **Logical Grouping**: Related functionality is grouped together
-- **Simplified Flow**: Main application logic is easier to follow
 
 ## Sample DDL Schemas
 
@@ -150,6 +145,30 @@ The project includes three sample schemas:
 1. **Company/Employee**: Companies, departments, employees, projects, benefits, reviews
 2. **Library Management**: Authors, publishers, books, branches, members, loans
 3. **Restaurant**: Restaurants, customers, orders, menu items, staff
+
+## Natural Language Querying
+
+The "Talk to your data" feature provides a conversational AI interface for querying your generated data:
+
+### Key Capabilities
+- **Natural Language Processing**: Ask questions in plain English about your data
+- **SQL Generation**: AI automatically converts your questions into safe SQL queries
+- **Data Visualization**: Automatic chart generation (bar, line, scatter, histogram)
+- **Security**: Built-in SQL injection and prompt injection protection
+- **Context Awareness**: Maintains conversation history for follow-up questions
+
+### Example Queries
+- "Show me the average salary by department"
+- "Which employees earn more than $75,000?"
+- "Create a chart showing the age distribution"
+- "How many orders were placed last month?"
+- "What's the most popular menu item?"
+
+### Security Features
+- Only SELECT queries are allowed (no data modification)
+- Pattern matching prevents dangerous SQL operations
+- Prompt injection detection blocks malicious inputs
+- Query validation before execution
 
 ## Configuration
 
@@ -182,6 +201,7 @@ The application integrates with Langfuse for:
 - Error tracking
 - User action analytics
 - Data generation session tracking
+- Chat conversation analysis
 
 ## Development
 
@@ -202,6 +222,12 @@ streamlit run app.py --server.runOnSave true
 
 Add new components in the `src/ui/` directory and import them in `app.py`.
 
+### Adding New Chat Features
+
+1. Extend `ChatInterface` class in `src/chat/chat_interface.py`
+2. Add function declarations for new AI capabilities
+3. Update UI components in `src/ui/chat_ui.py`
+
 ## Troubleshooting
 
 ### Common Issues
@@ -221,7 +247,12 @@ Add new components in the `src/ui/` directory and import them in `app.py`.
    - Simplify your instructions
    - Check Langfuse logs for detailed error information
 
-4. **Docker issues**:
+4. **Chat/Query issues**:
+   - Ensure you have generated data before using the chat feature
+   - Check that your natural language queries are clear and specific
+   - Verify database connectivity if queries fail
+
+5. **Docker issues**:
    - Ensure Docker has sufficient memory allocated
    - Check container logs: `docker-compose logs app`
 
